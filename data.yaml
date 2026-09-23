@@ -1,0 +1,5 @@
+path: dataset/Pothole.Dataset.IVCNZ/Pothole Dataset
+train: images/train
+val: images/val
+names:
+  0: pothole
