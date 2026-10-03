@@ -1,0 +1,16 @@
+{
+  "recommendations": [
+    "dart-code.flutter",
+    "dart-code.dart-code",
+    "nash.awesome-flutter-snippets",
+    "jeroen-meijer.pubspec-assist",
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.debugpy",
+    "ms-toolsai.jupyter",
+    "redhat.vscode-yaml",
+    "usernamehw.errorlens",
+    "eamodio.gitlens",
+    "vscjava.vscode-gradle"
+  ]
+}

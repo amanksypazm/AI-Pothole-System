@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "supabase": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=cttjbuuzzocxokwdrhxv&read_only=true&features=database"
+    }
+  }
+}
