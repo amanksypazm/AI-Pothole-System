@@ -40,7 +40,12 @@ grant insert (
   client_id, reporter_id, issue_type, severity, description, latitude,
   longitude, accuracy_meters, photo_url, photo_storage_path, created_at
 ) on public.road_reports to authenticated;
-grant update (status, updated_at, last_confirmed_at, photo_storage_path)
+-- The mobile client only needs to attach an uploaded photo to an existing
+-- report after retrying an upload. Keep report lifecycle fields read-only.
+revoke update on public.road_reports from authenticated;
+revoke update (status, updated_at, last_confirmed_at, photo_storage_path)
+  on public.road_reports from authenticated;
+grant update (photo_storage_path)
   on public.road_reports to authenticated;
 
 drop policy if exists "Signed-in users can view road reports"
@@ -56,7 +61,9 @@ create policy "Users can create their own road reports"
 
 drop policy if exists "Users can update their own road report status"
   on public.road_reports;
-create policy "Users can update their own road report status"
+drop policy if exists "Users can attach photos to their own road reports"
+  on public.road_reports;
+create policy "Users can attach photos to their own road reports"
   on public.road_reports for update to authenticated
   using (auth.uid() = reporter_id)
   with check (auth.uid() = reporter_id);

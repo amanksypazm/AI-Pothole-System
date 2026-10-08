@@ -1,24 +1,29 @@
 # Shared road reports setup
 
-The Flutter app stores every report and finished road review locally first. Cloud sync is enabled only
-when the app is built with a Supabase project URL and publishable key.
+The Flutter app stores every report and finished road review locally first. The app now has the
+project URL and publishable key configured as client-safe defaults, so the usual `flutter run`
+command enables cloud sync without extra arguments. A publishable key is intended for client apps;
+never put a `service_role` or secret key in the app.
 
 1. Create a Supabase project and enable **Anonymous Sign-Ins** in Auth settings.
 2. Run `supabase_road_reports.sql` in that project's SQL Editor for shared pothole reports and photos.
 3. Run `supabase_road_reviews.sql` in that project's SQL Editor to create the GPS route review table and its access policies.
-4. Copy the project URL and publishable key from the project's Connect panel.
-5. From the `mobile app` folder, build/run Flutter with:
+4. Run `supabase_profile_account.sql` in the SQL Editor for per-user profiles, private profile-photo storage, notifications, RLS, and self-service account deletion.
+5. In Auth settings, enable email/password sign-in and email confirmations. Add `potholeai://auth-callback` to the allowed redirect URLs for email verification, email changes, and password resets. Keep anonymous sign-in enabled for guest mode.
+6. The app is configured for project `cttjbuuzzocxokwdrhxv`. If you use a different project, copy its
+   URL and publishable key from the Connect panel and override the defaults when building/running.
+7. From the `mobile app` folder, run:
 
 ```powershell
-flutter run --dart-define=SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co --dart-define=SUPABASE_PUBLISHABLE_KEY=YOUR_PUBLISHABLE_KEY
+flutter run
 ```
 
-Use the same values with `flutter build apk --release --target-platform
-android-arm64` when making a smaller APK for modern Android phones. Never put
-a `service_role` or secret key in the app. Re-run the SQL script after updating
-the app: it creates a private `road-report-photos` bucket with a 10 MB per-photo
-limit. Report photos upload there, and the app displays them through signed
-links that expire after one hour. Local photos remain saved on the phone too.
+For a different project, add `--dart-define=SUPABASE_URL=...` and
+`--dart-define=SUPABASE_PUBLISHABLE_KEY=...`. Re-run the SQL scripts in that
+project: they create the shared-report/review tables and a private
+`road-report-photos` bucket with a 10 MB per-photo limit. Report photos upload
+there, and the app displays them through signed links that expire after one hour.
+Local photos remain saved on the phone too.
 
 Pothole report details/photos and GPS routes that a user explicitly starts and
 finishes as road reviews are synced. The model-training dataset is not app

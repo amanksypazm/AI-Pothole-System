@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -17,6 +18,7 @@ import kotlin.math.min
 class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
     private var pendingProfilePhotoResult: MethodChannel.Result? = null
     private val profilePhotoRequestCode = 7314
+    private val profileCameraRequestCode = 7315
     private var textToSpeech: TextToSpeech? = null
     private var ttsReady = false
 
@@ -69,12 +71,36 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
                         result.error("PICKER_UNAVAILABLE", error.message, null)
                     }
                 }
+                "captureProfilePhoto" -> {
+                    if (pendingProfilePhotoResult != null) {
+                        result.error("PICKER_BUSY", "Photo picker is already open.", null)
+                        return@setMethodCallHandler
+                    }
+                    pendingProfilePhotoResult = result
+                    try {
+                        startActivityForResult(
+                            Intent(MediaStore.ACTION_IMAGE_CAPTURE),
+                            profileCameraRequestCode,
+                        )
+                    } catch (error: Exception) {
+                        pendingProfilePhotoResult = null
+                        result.error("CAMERA_UNAVAILABLE", error.message, null)
+                    }
+                }
                 "getRoadPhotoDirectory" -> {
                     val photoDirectory = File(filesDir, "road_report_photos")
                     if (photoDirectory.exists() || photoDirectory.mkdirs()) {
                         result.success(photoDirectory.absolutePath)
                     } else {
                         result.error("PHOTO_STORAGE", "Could not create photo storage.", null)
+                    }
+                }
+                "getRoadVideoDirectory" -> {
+                    val videoDirectory = File(filesDir, "road_scan_videos")
+                    if (videoDirectory.exists() || videoDirectory.mkdirs()) {
+                        result.success(videoDirectory.absolutePath)
+                    } else {
+                        result.error("VIDEO_STORAGE", "Could not create video storage.", null)
                     }
                 }
 
@@ -140,6 +166,25 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
 
     @Deprecated("Deprecated in Android, retained for Flutter's activity result flow")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == profileCameraRequestCode) {
+            val result = pendingProfilePhotoResult
+            pendingProfilePhotoResult = null
+            if (result == null) return
+            if (resultCode != RESULT_OK) {
+                result.success(null)
+                return
+            }
+            try {
+                val bitmap = data?.extras?.get("data") as? Bitmap
+                    ?: throw IllegalStateException("The camera did not return a photo.")
+                val path = saveProfilePhoto(bitmap).absolutePath
+                if (!bitmap.isRecycled) bitmap.recycle()
+                result.success(path)
+            } catch (error: Exception) {
+                result.error("PHOTO_CAPTURE_FAILED", error.message, null)
+            }
+            return
+        }
         if (requestCode == profilePhotoRequestCode) {
             val result = pendingProfilePhotoResult
             pendingProfilePhotoResult = null
@@ -170,6 +215,12 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         val source = contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, options)
         } ?: throw IllegalStateException("Could not decode selected image.")
+        val photo = saveProfilePhoto(source)
+        source.recycle()
+        return photo
+    }
+
+    private fun saveProfilePhoto(source: Bitmap): File {
         val squareSize = min(source.width, source.height)
         val cropped = Bitmap.createBitmap(
             source,
@@ -185,7 +236,6 @@ class MainActivity : FlutterActivity(), TextToSpeech.OnInitListener {
         }
         if (avatar !== cropped) avatar.recycle()
         if (cropped !== source) cropped.recycle()
-        source.recycle()
         return destination
     }
 

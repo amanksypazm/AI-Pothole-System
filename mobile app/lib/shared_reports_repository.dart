@@ -5,13 +5,19 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 /// Cloud sync stays disabled until the app is built with a Supabase project.
 /// Never put a Supabase secret/service-role key in this mobile app.
 class SharedReportsRepository {
-  static const _projectUrl = String.fromEnvironment('SUPABASE_URL');
+  static const _projectUrl = String.fromEnvironment(
+    'SUPABASE_URL',
+    defaultValue: 'https://cttjbuuzzocxokwdrhxv.supabase.co',
+  );
   static const _publishableKey = String.fromEnvironment(
     'SUPABASE_PUBLISHABLE_KEY',
+    defaultValue: 'sb_publishable_sJUhA8c7P2Lcak5TqFDRLg_3fpsh86g',
   );
   static const _photoBucket = 'road-report-photos';
 
   SupabaseClient? _client;
+
+  SupabaseClient? get client => _client;
 
   bool get isConfigured => _projectUrl.isNotEmpty && _publishableKey.isNotEmpty;
 

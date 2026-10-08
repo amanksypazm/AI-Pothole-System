@@ -1,18 +1,22 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:onnxruntime_plus/onnxruntime_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-import 'settings_screen.dart';
 import 'shared_reports_repository.dart';
+import 'account_auth_screen.dart';
+import 'profile_account_screen.dart';
 
 import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:math' as math;
 
 import 'package:image/image.dart' as img;
 
@@ -70,7 +74,7 @@ Future<void> main() async {
   );
 }
 
-class PotholeApp extends StatelessWidget {
+class PotholeApp extends StatefulWidget {
   final List<CameraDescription> cameras;
   final SharedReportsRepository sharedReportsRepository;
 
@@ -81,15 +85,120 @@ class PotholeApp extends StatelessWidget {
   });
 
   @override
+  State<PotholeApp> createState() => _PotholeAppState();
+}
+
+class _PotholeAppState extends State<PotholeApp> {
+  ThemeMode _themeMode = ThemeMode.light;
+  Locale _locale = const Locale('en');
+  User? _sessionUser;
+  bool _passwordRecovery = false;
+  StreamSubscription<AuthState>? _authSubscription;
+  Future<void> _cachedPreferencesLoaded = Future<void>.value();
+
+  @override
+  void initState() {
+    super.initState();
+    final client = widget.sharedReportsRepository.client;
+    _sessionUser = client?.auth.currentUser;
+    _cachedPreferencesLoaded = _loadCachedPreferences();
+    if (client != null) {
+      _authSubscription = client.auth.onAuthStateChange.listen((state) {
+        if (!mounted) return;
+        setState(() {
+          _sessionUser = state.session?.user;
+          if (state.event == AuthChangeEvent.passwordRecovery) {
+            _passwordRecovery = true;
+          }
+        });
+        _loadRemotePreferences(state.session?.user);
+      });
+    }
+    _loadRemotePreferences(_sessionUser);
+  }
+
+  Future<void> _loadCachedPreferences() async {
+    final preferences = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final userId = _sessionUser?.id;
+    setState(() {
+      _themeMode = preferences.getBool('profileDarkMode_$userId') == true
+          ? ThemeMode.dark
+          : ThemeMode.light;
+      _locale = Locale(
+        preferences.getString('profileAccountLanguage_$userId') ?? 'en',
+      );
+    });
+  }
+
+  Future<void> _loadRemotePreferences(User? user) async {
+    await _cachedPreferencesLoaded;
+    final client = widget.sharedReportsRepository.client;
+    if (user == null || client == null) return;
+    try {
+      final row = await client
+          .from('profiles')
+          .select('account_language,dark_mode')
+          .eq('id', user.id)
+          .maybeSingle();
+      if (!mounted || _sessionUser?.id != user.id || row == null) return;
+      final darkMode = row['dark_mode'] as bool? ?? false;
+      final language = row['account_language'] as String? ?? 'en';
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setBool('profileDarkMode_${user.id}', darkMode);
+      await preferences.setString(
+        'profileAccountLanguage_${user.id}',
+        language,
+      );
+      if (!mounted || _sessionUser?.id != user.id) return;
+      setState(() {
+        _themeMode = darkMode ? ThemeMode.dark : ThemeMode.light;
+        _locale = Locale(language);
+      });
+    } catch (_) {
+      // Keep the last per-account cache available while the profile service is offline.
+    }
+  }
+
+  void _setDarkMode(bool enabled) {
+    setState(() => _themeMode = enabled ? ThemeMode.dark : ThemeMode.light);
+  }
+
+  void _setLanguage(String language) {
+    setState(() => _locale = Locale(language));
+  }
+
+  @override
+  void dispose() {
+    _authSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'AIpothole Detection',
-      theme: ThemeData.dark(),
-      home: HomeScreen(
-        cameras: cameras,
-        sharedReportsRepository: sharedReportsRepository,
-      ),
+      title: 'Pothole AI',
+      theme: ThemeData.light(useMaterial3: true),
+      darkTheme: ThemeData.dark(useMaterial3: true),
+      themeMode: _themeMode,
+      locale: _locale,
+      supportedLocales: const [Locale('en'), Locale('hi')],
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
+      home: _passwordRecovery
+          ? AccountAuthScreen(
+              repository: widget.sharedReportsRepository,
+              initialMode: AccountAuthMode.resetPassword,
+              onPasswordReset: () => setState(() => _passwordRecovery = false),
+            )
+          : _sessionUser == null
+          ? AccountAuthScreen(repository: widget.sharedReportsRepository)
+          : HomeScreen(
+              cameras: widget.cameras,
+              sharedReportsRepository: widget.sharedReportsRepository,
+              onDarkModeChanged: _setDarkMode,
+              onLanguageChanged: _setLanguage,
+            ),
     );
   }
 }
@@ -229,14 +338,20 @@ class RoadReview {
   );
 }
 
+enum _RoadMapAction { home, reports, profile, manualReport, roadReview }
+
 class HomeScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
   final SharedReportsRepository sharedReportsRepository;
+  final ValueChanged<bool> onDarkModeChanged;
+  final ValueChanged<String> onLanguageChanged;
 
   const HomeScreen({
     super.key,
     required this.cameras,
     required this.sharedReportsRepository,
+    required this.onDarkModeChanged,
+    required this.onLanguageChanged,
   });
 
   @override
@@ -249,7 +364,7 @@ class _HomeScreenState extends State<HomeScreen> {
   late final Future<void> _reportsLoaded;
   int _selectedTab = 0;
   bool _cloudReviewsLoading = false;
-  String _searchQuery = '';
+  bool _isAddMenuOpen = false;
 
   @override
   void initState() {
@@ -276,13 +391,12 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getStringList('roadReviews') ?? const <String>[];
-      final savedReviews = saved
-          .map(
-            (item) =>
-                RoadReview.fromJson(jsonDecode(item) as Map<String, dynamic>),
-          )
-          .toList();
-      if (mounted) setState(() => _roadReviews.addAll(savedReviews));
+      _roadReviews.addAll(
+        saved.map(
+          (item) =>
+              RoadReview.fromJson(jsonDecode(item) as Map<String, dynamic>),
+        ),
+      );
     } catch (error) {
       debugPrint('Could not load road reviews: $error');
     }
@@ -356,6 +470,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (review == null || !mounted) return;
     setState(() => _roadReviews.insert(0, review));
     await _saveRoadReviews();
+    if (!mounted) return;
     if (!widget.sharedReportsRepository.isConfigured) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -482,7 +597,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
     if (!mounted) return;
-    await Navigator.of(context).push<void>(
+    final action = await Navigator.of(context).push<_RoadMapAction>(
       MaterialPageRoute(
         builder: (_) => RoadMapScreen(
           reports: List.unmodifiable(reportsForMap),
@@ -490,6 +605,19 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case _RoadMapAction.home:
+        setState(() => _selectedTab = 0);
+      case _RoadMapAction.reports:
+        setState(() => _selectedTab = 1);
+      case _RoadMapAction.profile:
+        setState(() => _selectedTab = 2);
+      case _RoadMapAction.manualReport:
+        await _openManualReport();
+      case _RoadMapAction.roadReview:
+        await _startRoadReview();
+    }
   }
 
   Future<void> _openCamera() async {
@@ -500,7 +628,11 @@ class _HomeScreenState extends State<HomeScreen> {
       MaterialPageRoute(
         builder: (_) => widget.cameras.isEmpty
             ? const CameraUnavailableScreen()
-            : CameraScreen(cameras: widget.cameras),
+            : CameraScreen(
+                cameras: widget.cameras,
+                captureAspectRatio: 9 / 16,
+                captureAspectLabel: '16:9',
+              ),
       ),
     );
     if (report == null || !mounted) return;
@@ -510,726 +642,395 @@ class _HomeScreenState extends State<HomeScreen> {
     await _syncReport(report);
   }
 
+  Future<void> _openSmartDetection() async {
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => widget.cameras.isEmpty
+            ? const CameraUnavailableScreen()
+            : CameraScreen(
+                cameras: widget.cameras,
+                captureAspectRatio: 9 / 16,
+                captureAspectLabel: '16:9',
+                smartMode: true,
+              ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final cloudReady = widget.sharedReportsRepository.isConfigured;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final pageColor = isDark
+        ? const Color(0xFF090F19)
+        : const Color(0xFFF5F7FC);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF090F19),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF090F19),
-        titleSpacing: 20,
-        title: const Row(
-          children: [
-            Icon(Icons.shield_outlined, color: Color(0xFF26C6DA), size: 25),
-            SizedBox(width: 9),
-            Text(
-              'AIpothole',
-              style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: .2),
-            ),
-          ],
-        ),
-        actions: [
-          Container(
-            margin: const EdgeInsets.only(right: 18),
-            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
-            decoration: BoxDecoration(
-              color: cloudReady
-                  ? const Color(0xFF103B34)
-                  : const Color(0xFF292F3A),
-              borderRadius: BorderRadius.circular(30),
-              border: Border.all(
-                color: cloudReady
-                    ? const Color(0xFF1E806B)
-                    : const Color(0xFF454E5D),
+      backgroundColor: pageColor,
+      appBar: _selectedTab == 0 || _selectedTab == 2
+          ? null
+          : AppBar(
+              backgroundColor: pageColor,
+              titleSpacing: 20,
+              title: const Row(
+                children: [
+                  Icon(
+                    Icons.shield_outlined,
+                    color: Color(0xFF26C6DA),
+                    size: 25,
+                  ),
+                  SizedBox(width: 9),
+                  Text(
+                    'AIpothole',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: .2,
+                    ),
+                  ),
+                ],
               ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  cloudReady ? Icons.cloud_done_outlined : Icons.phone_android,
-                  size: 16,
-                  color: cloudReady ? const Color(0xFF62D6B2) : Colors.white70,
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  cloudReady ? 'SYNC SET' : 'ON DEVICE',
-                  style: const TextStyle(
-                    fontSize: 10,
-                    letterSpacing: .6,
-                    fontWeight: FontWeight.bold,
+              actions: [
+                Container(
+                  margin: const EdgeInsets.only(right: 18),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 11,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: cloudReady
+                        ? const Color(0xFF103B34)
+                        : const Color(0xFF292F3A),
+                    borderRadius: BorderRadius.circular(30),
+                    border: Border.all(
+                      color: cloudReady
+                          ? const Color(0xFF1E806B)
+                          : const Color(0xFF454E5D),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        cloudReady
+                            ? Icons.cloud_done_outlined
+                            : Icons.phone_android,
+                        size: 16,
+                        color: cloudReady
+                            ? const Color(0xFF62D6B2)
+                            : Colors.white70,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        cloudReady ? 'SYNC SET' : 'ON DEVICE',
+                        style: const TextStyle(
+                          fontSize: 10,
+                          letterSpacing: .6,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
-          ),
-        ],
-      ),
       body: _selectedTab == 0
-          ? _buildHomeDashboard(cloudReady)
+          ? _buildLandingHome()
           : SafeArea(child: _buildSelectedTab()),
-      floatingActionButton: _selectedTab == 4
-          ? null
-          : FloatingActionButton(
-              onPressed: _showAddActions,
-              tooltip: 'Add a report or road review',
-              backgroundColor: const Color(0xFF7DE5E9),
-              foregroundColor: const Color(0xFF062034),
-              shape: const CircleBorder(),
-              child: const Icon(Icons.add, size: 30),
-            ),
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
       bottomNavigationBar: BottomAppBar(
-        color: const Color(0xFF101722),
-        shape: _selectedTab == 4 ? null : const CircularNotchedRectangle(),
-        notchMargin: 7,
+        color: isDark ? const Color(0xFF101722) : Colors.white,
+        surfaceTintColor: Colors.transparent,
         child: SizedBox(
-          height: 58,
+          height: 64,
           child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: _selectedTab == 4
-                ? [
-                    _navItem(Icons.home_outlined, Icons.home, 'Home', 0),
-                    _navItem(Icons.person_outline, Icons.person, 'Profile', 4),
-                  ]
-                : [
-                    _navItem(Icons.home_outlined, Icons.home, 'Home', 0),
-                    _navItem(Icons.search_outlined, Icons.search, 'Explore', 1),
-                    const SizedBox(width: 52),
-                    _navItem(
-                      Icons.list_alt_outlined,
-                      Icons.list_alt,
-                      'Reports',
-                      3,
-                    ),
-                    _navItem(Icons.person_outline, Icons.person, 'Profile', 4),
-                  ],
+            children: [
+              _navItem(Icons.home_outlined, Icons.home, 'Home', 0),
+              _addNavItem(),
+              _navItem(Icons.list_alt_outlined, Icons.list_alt, 'Reports', 1),
+              _navItem(Icons.person_outline, Icons.person, 'Profile', 2),
+            ],
           ),
         ),
       ),
     );
   }
 
-  Widget _buildHomeDashboard(bool cloudReady) {
-    final recentReports = List<RoadIssueReport>.of(_reports)
-      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    final majorReports = recentReports
-        .where((report) => report.severity == 'Major')
-        .toList();
-
+  Widget _buildLandingHome() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final primaryText = isDark
+        ? const Color(0xFFE4F6FA)
+        : const Color(0xFF14253D);
+    final secondaryText = isDark
+        ? const Color(0xFFB7C7CE)
+        : const Color(0xFF53647B);
     return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 12, 20, 30),
-        children: [
-          _buildSafetySummary(cloudReady, majorReports.length),
-          const SizedBox(height: 14),
-          _buildDetectionCard(),
-          const SizedBox(height: 22),
-          Row(
-            children: [
-              Expanded(
-                child: _buildHomeStat(
-                  icon: Icons.warning_amber_rounded,
-                  label: 'Road reports',
-                  value: '${_reports.length}',
-                  color: const Color(0xFFFFB454),
-                ),
+      child: LayoutBuilder(
+        builder: (context, constraints) => ListView(
+          padding: const EdgeInsets.fromLTRB(9, 18, 9, 16),
+          children: [
+            Text.rich(
+              TextSpan(
+                children: [
+                  TextSpan(text: 'Detect Potholes.\n'),
+                  TextSpan(
+                    text: 'Prevent Accidents.\n',
+                    style: const TextStyle(color: Color(0xFF00AFC0)),
+                  ),
+                  TextSpan(text: 'Build Safer Roads.'),
+                ],
               ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: _buildHomeStat(
-                  icon: Icons.route_outlined,
-                  label: 'Saved reviews',
-                  value: '${_roadReviews.length}',
-                  color: const Color(0xFF62D6B2),
-                ),
+              style: TextStyle(
+                fontSize: 27,
+                height: 1.22,
+                fontWeight: FontWeight.w800,
+                letterSpacing: -.55,
+                color: primaryText,
               ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          _buildHomeSectionTitle(
-            'Latest road reports',
-            trailing: 'On this phone',
-            onTap: () => setState(() => _selectedTab = 3),
-          ),
-          const SizedBox(height: 12),
-          if (_reports.isEmpty)
-            _buildEmptyHomeCard(
-              icon: Icons.location_searching,
-              title: 'No road reports yet',
-              subtitle: 'Add a GPS report or scan the road with your camera.',
-              actionLabel: 'Add GPS report',
-              onTap: _openManualReport,
-            )
-          else
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'On-device YOLO11 pothole detection with phone-GPS reports and a community road map.',
+              style: TextStyle(
+                color: secondaryText,
+                fontSize: 13,
+                height: 1.55,
+              ),
+            ),
+            const SizedBox(height: 16),
             SizedBox(
-              height: 146,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: recentReports.take(6).length,
-                separatorBuilder: (_, _) => const SizedBox(width: 10),
-                itemBuilder: (context, index) {
-                  final report = recentReports[index];
-                  final color = report.severity == 'Major'
-                      ? const Color(0xFFFF837D)
-                      : const Color(0xFFFFCA72);
-                  return SizedBox(
-                    width: 260,
-                    child: Card(
-                      color: const Color(0xFF101D26),
-                      clipBehavior: Clip.antiAlias,
-                      child: InkWell(
-                        onTap: _openMap,
-                        child: Padding(
-                          padding: const EdgeInsets.all(14),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Icon(
-                                    report.issueType == 'Pothole'
-                                        ? Icons.warning_amber_rounded
-                                        : Icons.construction,
-                                    color: color,
-                                    size: 19,
-                                  ),
-                                  const SizedBox(width: 7),
-                                  Expanded(
-                                    child: Text(
-                                      '${report.severity} ${report.issueType}',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        color: color,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                ],
+              height: 48,
+              child: FilledButton.icon(
+                onPressed: _openCamera,
+                icon: const Icon(Icons.videocam, size: 19),
+                label: const Text('Start Detection  →'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF00DCEB),
+                  foregroundColor: const Color(0xFF07131B),
+                  textStyle: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    side: const BorderSide(
+                      color: Color(0xFF77F6FF),
+                      width: 1.4,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 7),
+            SizedBox(
+              height: 44,
+              child: OutlinedButton.icon(
+                onPressed: _startRoadReview,
+                icon: const Icon(Icons.route_outlined, size: 19),
+                label: const Text('Start Road Review'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: primaryText,
+                  side: BorderSide(
+                    color: isDark
+                        ? const Color(0xFF344458)
+                        : const Color(0xFFC6D0DF),
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(9),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+            _buildDetectionPreview(constraints.maxWidth - 18),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDetectionPreview(double availableWidth) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final cardColor = isDark ? const Color(0xFF151B26) : Colors.white;
+    final cardBorder = isDark
+        ? const Color(0xFF29313D)
+        : const Color(0xFFDCE3EE);
+    final cardText = isDark ? const Color(0xFFCBD8DF) : const Color(0xFF46566D);
+    final previewHeight = (availableWidth * .62).clamp(190.0, 250.0).toDouble();
+    return Semantics(
+      button: true,
+      label: 'Open live AI road detection camera',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(15),
+        onTap: _openSmartDetection,
+        child: Container(
+          decoration: BoxDecoration(
+            color: cardColor,
+            borderRadius: BorderRadius.circular(15),
+            border: Border.all(color: cardBorder),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 15, vertical: 10),
+                child: Row(
+                  children: [
+                    Icon(Icons.circle, color: Color(0xFFFF7777), size: 9),
+                    SizedBox(width: 8),
+                    Text(
+                      'DETECTION PREVIEW',
+                      style: TextStyle(
+                        color: Color(0xFFFFA3A3),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: .5,
+                      ),
+                    ),
+                    Spacer(),
+                    Text(
+                      'TAP TO SCAN',
+                      style: TextStyle(
+                        color: Color(0xFF00DCEB),
+                        fontSize: 9,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(
+                height: previewHeight,
+                width: double.infinity,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Image.asset(
+                      'assets/home_pothole_sample.jpg',
+                      fit: BoxFit.cover,
+                    ),
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.black.withValues(alpha: .24),
+                            Colors.transparent,
+                            Colors.black.withValues(alpha: .68),
+                          ],
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: availableWidth * .24,
+                      top: previewHeight * .33,
+                      width: availableWidth * .36,
+                      height: previewHeight * .27,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: const Color(0xFF00E5F0),
+                            width: 2,
+                          ),
+                          borderRadius: BorderRadius.circular(5),
+                        ),
+                        child: Align(
+                          alignment: Alignment.topLeft,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 4,
+                            ),
+                            color: const Color(0xFFFFA5A0),
+                            child: const Text(
+                              'POTHOLE • SAMPLE',
+                              style: TextStyle(
+                                color: Color(0xFF251619),
+                                fontSize: 9,
+                                fontWeight: FontWeight.w900,
                               ),
-                              const Spacer(),
-                              Text(
-                                '${report.latitude.toStringAsFixed(5)}, ${report.longitude.toStringAsFixed(5)}',
-                                style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 12,
-                                ),
-                              ),
-                              const SizedBox(height: 5),
-                              Text(
-                                _formatHomeTime(report.createdAt),
-                                style: const TextStyle(
-                                  color: Colors.white54,
-                                  fontSize: 11,
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  );
-                },
-              ),
-            ),
-          const SizedBox(height: 22),
-          _buildHomeSectionTitle('Road condition map', onTap: _openMap),
-          const SizedBox(height: 12),
-          _buildMapActionCard(),
-          if (majorReports.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            _buildMajorReportAlert(majorReports.first),
-          ],
-          const SizedBox(height: 22),
-          _buildHomeSectionTitle(
-            'Recent activity',
-            onTap: () => setState(() => _selectedTab = 3),
-          ),
-          const SizedBox(height: 12),
-          if (recentReports.isEmpty)
-            _buildEmptyHomeCard(
-              icon: Icons.history,
-              title: 'Your activity will appear here',
-              subtitle: 'Reports you add are listed here for quick access.',
-              actionLabel: 'Start a road review',
-              onTap: _startRoadReview,
-            )
-          else
-            ...recentReports
-                .take(3)
-                .map(
-                  (report) => Card(
-                    color: const Color(0xFF101D26),
-                    child: ListTile(
-                      onTap: _openMap,
-                      leading: Icon(
-                        report.issueType == 'Pothole'
-                            ? Icons.warning_amber_rounded
-                            : Icons.construction,
-                        color: report.severity == 'Major'
-                            ? const Color(0xFFFF837D)
-                            : const Color(0xFFFFCA72),
+                    Positioned(
+                      left: 12,
+                      bottom: 10,
+                      child: Text(
+                        'Example model overlay · start detection for live camera',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                      title: Text('${report.issueType} report added'),
-                      subtitle: Text(
-                        '${report.severity} · ${_formatHomeTime(report.createdAt)}',
-                      ),
-                      trailing: const Icon(Icons.chevron_right),
                     ),
-                  ),
+                  ],
                 ),
-          const SizedBox(height: 15),
-          const Text(
-            'More ways to help',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.satellite_alt,
+                      size: 15,
+                      color: Color(0xFF79DCE5),
+                    ),
+                    SizedBox(width: 7),
+                    Text(
+                      'Phone-GPS tagged reports',
+                      style: TextStyle(
+                        color: cardText,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    Spacer(),
+                    Text(
+                      'ON-DEVICE YOLO',
+                      style: TextStyle(
+                        color: Color(0xFF7DE5B4),
+                        fontSize: 9,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 11),
-          _HomeActionCard(
-            icon: Icons.edit_location_alt,
-            title: 'Report with GPS',
-            subtitle: 'Add a road issue without taking a photo',
-            color: const Color(0xFF16B8C9),
-            onTap: _openManualReport,
-          ),
-          _HomeActionCard(
-            icon: Icons.route_outlined,
-            title: 'Review a road',
-            subtitle: 'Record its GPS route, rate it 1–10 and recommend it',
-            color: const Color(0xFF62D6B2),
-            onTap: _startRoadReview,
-          ),
-        ],
+        ),
       ),
     );
-  }
-
-  Widget _buildSafetySummary(bool cloudReady, int majorReportCount) {
-    final hasMajorReports = majorReportCount > 0;
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(23),
-        border: Border.all(
-          color: hasMajorReports
-              ? const Color(0x66FF837D)
-              : const Color(0xFF245747),
-        ),
-        gradient: LinearGradient(
-          colors: hasMajorReports
-              ? const [Color(0xFF382326), Color(0xFF18212A)]
-              : const [Color(0xFF142B32), Color(0xFF101D26)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(
-                Icons.health_and_safety_outlined,
-                color: Color(0xFF7DE5E9),
-                size: 20,
-              ),
-              const SizedBox(width: 8),
-              const Expanded(
-                child: Text(
-                  'ROAD SAFETY SNAPSHOT',
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: 11,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1,
-                  ),
-                ),
-              ),
-              Icon(
-                cloudReady ? Icons.cloud_done_outlined : Icons.phone_android,
-                color: cloudReady ? const Color(0xFF62D6B2) : Colors.white54,
-                size: 17,
-              ),
-              const SizedBox(width: 5),
-              Text(
-                cloudReady ? 'SYNC ON' : 'ON DEVICE',
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 9,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 17),
-          Text(
-            hasMajorReports
-                ? 'Drive with extra care'
-                : 'Help make journeys safer',
-            style: const TextStyle(
-              fontSize: 24,
-              height: 1.15,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          const SizedBox(height: 7),
-          Text(
-            hasMajorReports
-                ? '$majorReportCount major ${majorReportCount == 1 ? 'issue is' : 'issues are'} in your saved reports.'
-                : 'Report road damage so other people can avoid it.',
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 13,
-              height: 1.4,
-            ),
-          ),
-          const SizedBox(height: 19),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(
-                '${_reports.length}',
-                style: const TextStyle(
-                  fontSize: 38,
-                  height: .95,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-              const Padding(
-                padding: EdgeInsets.only(left: 7, bottom: 3),
-                child: Text(
-                  'road reports',
-                  style: TextStyle(color: Colors.white70, fontSize: 12),
-                ),
-              ),
-              const Spacer(),
-              Text(
-                hasMajorReports ? 'CAUTION' : 'COMMUNITY',
-                style: TextStyle(
-                  color: hasMajorReports
-                      ? const Color(0xFFFF837D)
-                      : const Color(0xFF62D6B2),
-                  fontWeight: FontWeight.w800,
-                  fontSize: 11,
-                  letterSpacing: .5,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 9),
-          Text(
-            cloudReady
-                ? 'Shared reports are available through cloud sync.'
-                : 'Reports are saved on this phone.',
-            style: const TextStyle(color: Colors.white54, fontSize: 11),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDetectionCard() => Container(
-    padding: const EdgeInsets.all(18),
-    decoration: BoxDecoration(
-      color: const Color(0xFF101D26),
-      borderRadius: BorderRadius.circular(21),
-      border: Border.all(color: const Color(0xFF263A40)),
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Container(
-              width: 44,
-              height: 44,
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A303B),
-                borderRadius: BorderRadius.circular(13),
-              ),
-              child: const Icon(
-                Icons.camera_alt_outlined,
-                color: Color(0xFF7DE5E9),
-              ),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'AI pothole detection',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                  SizedBox(height: 3),
-                  Text(
-                    'Camera scan',
-                    style: TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                ],
-              ),
-            ),
-            const Text(
-              'READY',
-              style: TextStyle(
-                color: Color(0xFF62D6B2),
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
-                letterSpacing: .5,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        const Text(
-          'Scan the road with the camera to detect and save a pothole report.',
-          style: TextStyle(color: Colors.white70, fontSize: 12, height: 1.4),
-        ),
-        const SizedBox(height: 14),
-        SizedBox(
-          width: double.infinity,
-          child: FilledButton.icon(
-            onPressed: _openCamera,
-            icon: const Icon(Icons.camera_alt_outlined),
-            label: const Text('Start camera detection'),
-            style: FilledButton.styleFrom(
-              foregroundColor: const Color(0xFF09241E),
-              backgroundColor: const Color(0xFF62D6B2),
-              padding: const EdgeInsets.symmetric(vertical: 13),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-            ),
-          ),
-        ),
-      ],
-    ),
-  );
-
-  Widget _buildHomeStat({
-    required IconData icon,
-    required String label,
-    required String value,
-    required Color color,
-  }) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 15),
-    decoration: BoxDecoration(
-      color: const Color(0xFF101D26),
-      borderRadius: BorderRadius.circular(17),
-      border: Border.all(color: const Color(0xFF26364A)),
-    ),
-    child: Row(
-      children: [
-        Icon(icon, color: color, size: 20),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                value,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-              Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Colors.white60, fontSize: 10),
-              ),
-            ],
-          ),
-        ),
-      ],
-    ),
-  );
-
-  Widget _buildHomeSectionTitle(
-    String title, {
-    String? trailing,
-    VoidCallback? onTap,
-  }) => Row(
-    children: [
-      Expanded(
-        child: Text(
-          title,
-          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-        ),
-      ),
-      if (trailing != null)
-        Padding(
-          padding: const EdgeInsets.only(right: 4),
-          child: Text(
-            trailing,
-            style: const TextStyle(color: Colors.white54, fontSize: 10),
-          ),
-        ),
-      if (onTap != null)
-        TextButton(
-          onPressed: onTap,
-          style: TextButton.styleFrom(
-            foregroundColor: const Color(0xFF7DE5E9),
-            padding: EdgeInsets.zero,
-            minimumSize: Size.zero,
-          ),
-          child: const Text('View all'),
-        ),
-    ],
-  );
-
-  Widget _buildEmptyHomeCard({
-    required IconData icon,
-    required String title,
-    required String subtitle,
-    required String actionLabel,
-    required VoidCallback onTap,
-  }) => Container(
-    padding: const EdgeInsets.all(16),
-    decoration: BoxDecoration(
-      color: const Color(0xFF101D26),
-      borderRadius: BorderRadius.circular(17),
-      border: Border.all(color: const Color(0xFF26364A)),
-    ),
-    child: Row(
-      children: [
-        Icon(icon, color: const Color(0xFF7DE5E9)),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4),
-              Text(
-                subtitle,
-                style: const TextStyle(color: Colors.white60, fontSize: 11),
-              ),
-              TextButton(
-                onPressed: onTap,
-                style: TextButton.styleFrom(
-                  foregroundColor: const Color(0xFF7DE5E9),
-                  padding: const EdgeInsets.only(top: 8),
-                  minimumSize: Size.zero,
-                ),
-                child: Text(actionLabel),
-              ),
-            ],
-          ),
-        ),
-      ],
-    ),
-  );
-
-  Widget _buildMapActionCard() => Card(
-    color: const Color(0xFF10242B),
-    clipBehavior: Clip.antiAlias,
-    child: InkWell(
-      onTap: _openMap,
-      child: Padding(
-        padding: const EdgeInsets.all(17),
-        child: Row(
-          children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A303B),
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: const Icon(Icons.map_outlined, color: Color(0xFF7DE5E9)),
-            ),
-            const SizedBox(width: 13),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Open road report map',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '${_reports.length} saved reports · view report locations',
-                    style: const TextStyle(color: Colors.white60, fontSize: 11),
-                  ),
-                ],
-              ),
-            ),
-            const Icon(Icons.arrow_forward_ios, size: 15),
-          ],
-        ),
-      ),
-    ),
-  );
-
-  Widget _buildMajorReportAlert(RoadIssueReport report) => Container(
-    padding: const EdgeInsets.all(15),
-    decoration: BoxDecoration(
-      color: const Color(0x663D2525),
-      borderRadius: BorderRadius.circular(16),
-      border: Border.all(color: const Color(0x66FF837D)),
-    ),
-    child: Row(
-      children: [
-        const Icon(Icons.warning_amber_rounded, color: Color(0xFFFF837D)),
-        const SizedBox(width: 11),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Major ${report.issueType} report',
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 4),
-              const Text(
-                'Review its location on the report map.',
-                style: TextStyle(color: Colors.white70, fontSize: 11),
-              ),
-            ],
-          ),
-        ),
-        IconButton(
-          onPressed: _openMap,
-          tooltip: 'Open report map',
-          icon: const Icon(Icons.open_in_new, size: 18),
-        ),
-      ],
-    ),
-  );
-
-  String _formatHomeTime(DateTime dateTime) {
-    final difference = DateTime.now().difference(dateTime.toLocal());
-    if (difference.inMinutes < 1) return 'Just now';
-    if (difference.inHours < 1) return '${difference.inMinutes} min ago';
-    if (difference.inDays < 1) return '${difference.inHours} hr ago';
-    if (difference.inDays < 7) return '${difference.inDays} days ago';
-    return '${dateTime.toLocal().day}/${dateTime.toLocal().month}/${dateTime.toLocal().year}';
   }
 
   Widget _navItem(IconData icon, IconData activeIcon, String label, int tab) {
     final selected = _selectedTab == tab;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final idleColor = isDark ? Colors.white60 : const Color(0xFF65748A);
     return Expanded(
       child: InkWell(
         borderRadius: BorderRadius.circular(14),
         onTap: () {
           setState(() => _selectedTab = tab);
-          if (tab == 1) _loadCloudRoadReviews();
         },
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Icon(
               selected ? activeIcon : icon,
-              color: selected ? const Color(0xFF7DE5E9) : Colors.white60,
+              color: selected ? const Color(0xFF16A9B9) : idleColor,
             ),
             Text(
               label,
               style: TextStyle(
                 fontSize: 10,
-                color: selected ? const Color(0xFF7DE5E9) : Colors.white60,
+                color: selected ? const Color(0xFF16A9B9) : idleColor,
                 fontWeight: selected ? FontWeight.bold : FontWeight.normal,
               ),
             ),
@@ -1239,104 +1040,28 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildSelectedTab() {
-    if (_selectedTab == 1) return _buildExploreTab();
-    if (_selectedTab == 3) return _buildReportsTab();
-    return _buildProfileTab();
-  }
+  Widget _addNavItem() => Expanded(
+    child: Center(
+      child: IconButton.filled(
+        onPressed: _showAddActions,
+        tooltip: 'Add a report or road review',
+        style: IconButton.styleFrom(
+          backgroundColor: _isAddMenuOpen
+              ? const Color(0xFF7DE5E9)
+              : const Color(0xFF737E8A),
+          foregroundColor: _isAddMenuOpen
+              ? const Color(0xFF062034)
+              : const Color(0xFFE4F6FA),
+          fixedSize: const Size(44, 44),
+        ),
+        icon: const Icon(Icons.add, size: 26),
+      ),
+    ),
+  );
 
-  Widget _buildExploreTab() {
-    final term = _searchQuery.trim().toLowerCase();
-    final visibleReports = _reports
-        .where(
-          (report) =>
-              term.isEmpty ||
-              '${report.issueType} ${report.severity} ${report.description}'
-                  .toLowerCase()
-                  .contains(term),
-        )
-        .toList();
-    final visibleReviews = _roadReviews
-        .where(
-          (review) =>
-              term.isEmpty ||
-              '${review.comment} ${review.recommend ? 'recommend' : 'not recommend'} ${review.rating}'
-                  .toLowerCase()
-                  .contains(term),
-        )
-        .toList();
-    return ListView(
-      padding: const EdgeInsets.all(18),
-      children: [
-        const Text(
-          'Explore roads',
-          style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 6),
-        const Text(
-          'Find nearby road hazards and community reviews.',
-          style: TextStyle(color: Colors.white60),
-        ),
-        const SizedBox(height: 16),
-        TextField(
-          decoration: const InputDecoration(
-            prefixIcon: Icon(Icons.search),
-            hintText: 'Search by issue, severity or comment',
-            border: OutlineInputBorder(),
-          ),
-          onChanged: (value) => setState(() => _searchQuery = value),
-        ),
-        const SizedBox(height: 12),
-        FilledButton.icon(
-          onPressed: _openMap,
-          icon: const Icon(Icons.map_outlined),
-          label: const Text('Open hazard map'),
-        ),
-        const SizedBox(height: 22),
-        Text(
-          'Nearby reports (${visibleReports.length})',
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        if (visibleReports.isNotEmpty)
-          ...visibleReports
-              .take(6)
-              .map(
-                (report) => Card(
-                  child: ListTile(
-                    leading: Icon(
-                      Icons.warning_amber_rounded,
-                      color: report.severity == 'Major'
-                          ? Colors.redAccent
-                          : Colors.orangeAccent,
-                    ),
-                    title: Text('${report.severity} ${report.issueType}'),
-                    subtitle: Text(
-                      '${report.latitude.toStringAsFixed(5)}, ${report.longitude.toStringAsFixed(5)}',
-                    ),
-                    onTap: _openMap,
-                  ),
-                ),
-              ),
-        const SizedBox(height: 16),
-        Text(
-          'Community road reviews (${visibleReviews.length})',
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        if (_cloudReviewsLoading) const LinearProgressIndicator(),
-        if (visibleReviews.isEmpty)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 28),
-            child: Center(
-              child: Text(
-                'No road reviews yet. Use + to review a road.',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          )
-        else
-          ...visibleReviews.map((review) => _RoadReviewCard(review: review)),
-      ],
-    );
+  Widget _buildSelectedTab() {
+    if (_selectedTab == 1) return _buildReportsTab();
+    return _buildProfileTab();
   }
 
   Widget _buildReportsTab() => ListView(
@@ -1388,163 +1113,57 @@ class _HomeScreenState extends State<HomeScreen> {
     ],
   );
 
-  Widget _buildProfileTab() => ProfileSection(
-    reportCount: _reports.length,
-    reviewCount: _roadReviews.length,
+  Widget _buildProfileTab() => ProfileAccountScreen(
+    repository: widget.sharedReportsRepository,
+    onBack: () => setState(() => _selectedTab = 0),
+    onDarkModeChanged: widget.onDarkModeChanged,
+    onLanguageChanged: widget.onLanguageChanged,
   );
 
   Future<void> _showAddActions() async {
-    final action = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: const Color(0xFF101722),
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 18, 16, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                'What would you like to add?',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              ListTile(
-                leading: const Icon(Icons.camera_alt_outlined),
-                title: const Text('Pothole report with camera'),
-                onTap: () => Navigator.pop(context, 'camera'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.edit_location_alt),
-                title: const Text('Pothole report with GPS'),
-                onTap: () => Navigator.pop(context, 'gps'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.route_outlined),
-                title: const Text('Start road review'),
-                onTap: () => Navigator.pop(context, 'review'),
-              ),
-            ],
+    setState(() => _isAddMenuOpen = true);
+    String? action;
+    try {
+      action = await showModalBottomSheet<String>(
+        context: context,
+        backgroundColor: const Color(0xFF101722),
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'What would you like to add?',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.camera_alt_outlined),
+                  title: const Text('Pothole report with camera'),
+                  onTap: () => Navigator.pop(context, 'camera'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.edit_location_alt),
+                  title: const Text('Pothole report with GPS'),
+                  onTap: () => Navigator.pop(context, 'gps'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.route_outlined),
+                  title: const Text('Start road review'),
+                  onTap: () => Navigator.pop(context, 'review'),
+                ),
+              ],
+            ),
           ),
         ),
-      ),
-    );
+      );
+    } finally {
+      if (mounted) setState(() => _isAddMenuOpen = false);
+    }
     if (!mounted) return;
     if (action == 'camera') await _openCamera();
     if (action == 'gps') await _openManualReport();
     if (action == 'review') await _startRoadReview();
-  }
-}
-
-class _RoadReviewCard extends StatelessWidget {
-  final RoadReview review;
-  const _RoadReviewCard({required this.review});
-
-  @override
-  Widget build(BuildContext context) => Card(
-    child: Padding(
-      padding: const EdgeInsets.all(14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                review.recommend
-                    ? Icons.thumb_up_alt_outlined
-                    : Icons.thumb_down_alt_outlined,
-                color: review.recommend
-                    ? const Color(0xFF62D6B2)
-                    : Colors.orangeAccent,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '${review.rating}/10 · ${review.recommend ? 'Recommended' : 'Not recommended'}',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '${(review.distanceMeters / 1000).toStringAsFixed(2)} km · ${_formatTripDuration(review.durationSeconds)} · ${review.routePoints.length} GPS points',
-          ),
-          Text(
-            'Start ${review.startLatitude.toStringAsFixed(5)}, ${review.startLongitude.toStringAsFixed(5)}',
-          ),
-          Text(
-            'End ${review.endLatitude.toStringAsFixed(5)}, ${review.endLongitude.toStringAsFixed(5)}',
-          ),
-          if (review.comment.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            Text(review.comment, style: const TextStyle(color: Colors.white70)),
-          ],
-        ],
-      ),
-    ),
-  );
-}
-
-class _HomeActionCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final Color color;
-  final VoidCallback onTap;
-
-  const _HomeActionCard({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.color,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 17),
-          child: Row(
-            children: [
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: color.withValues(alpha: 0.18),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Icon(icon, color: color),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: const TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      subtitle,
-                      style: const TextStyle(
-                        color: Colors.white60,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const Icon(Icons.chevron_right),
-            ],
-          ),
-        ),
-      ),
-    );
   }
 }
 
@@ -1664,104 +1283,25 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
     await _calculatePlannedRoute();
   }
 
-  Future<void> _openRoutePlanner() async {
+  Future<void> _openDestinationPicker() async {
+    if (_recording || _finished) return;
     final start = _startPosition;
-
     if (start == null) {
-      setState(() {
-        _error = 'Pehle current GPS location milne dein.';
-      });
-      return;
-    }
-
-    final destination = await Navigator.of(context).push<LatLng>(
-      MaterialPageRoute(
-        fullscreenDialog: true,
-        builder: (_) => RoutePlannerScreen(
-          startLocation: LatLng(start.latitude, start.longitude),
-        ),
-      ),
-    );
-
-    if (destination != null && mounted) {
-      await _selectDestination(destination);
-    }
-  }
-
-  Future<void> _openFullScreenMap() async {
-    if (_startPosition == null) {
       setState(() => _error = 'Pehle current GPS location milne dein.');
       return;
     }
-
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return Dialog.fullscreen(
-          child: Scaffold(
-            backgroundColor: const Color(0xFF0B1220),
-            appBar: AppBar(
-              title: const Text('Plan your road review'),
-              backgroundColor: const Color(0xFF0B1220),
-              foregroundColor: Colors.white,
-            ),
-            body: Stack(
-              children: [
-                MapLibreMap(
-                  styleString: 'https://tiles.openfreemap.org/styles/liberty',
-                  initialCameraPosition: CameraPosition(
-                    target: LatLng(
-                      _startPosition!.latitude,
-                      _startPosition!.longitude,
-                    ),
-                    zoom: 15,
-                  ),
-                  myLocationEnabled: true,
-                  onMapClick: (_, coordinates) async {
-                    Navigator.of(dialogContext).pop();
-                    await _selectDestination(coordinates);
-                  },
-                ),
-                Positioned(
-                  top: 16,
-                  left: 16,
-                  right: 16,
-                  child: Card(
-                    color: const Color(0xFF182131),
-                    child: Padding(
-                      padding: const EdgeInsets.all(14),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Choose your destination',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          const Text(
-                            'From: Current location',
-                            style: TextStyle(color: Colors.white70),
-                          ),
-                          const SizedBox(height: 4),
-                          const Text(
-                            'Tap anywhere on the map to choose destination',
-                            style: TextStyle(color: Colors.white54),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+    final destination = await Navigator.of(context).push<LatLng>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => RoadDestinationPickerScreen(
+          startLocation: _latLng(start),
+          initialDestination: _destination,
+        ),
+      ),
     );
+    if (destination != null && mounted) {
+      await _selectDestination(destination);
+    }
   }
 
   Future<void> _calculatePlannedRoute({Position? fromPosition}) async {
@@ -1962,7 +1502,7 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
     });
     try {
       if (_destination == null) {
-        throw Exception('Map par tap karke destination select karein.');
+        throw Exception('Full-screen map par destination choose karein.');
       }
       await _ensureLocationPermission();
       final first = await Geolocator.getCurrentPosition(
@@ -2030,8 +1570,9 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
               }
             },
             onError: (Object error) {
-              if (mounted)
+              if (mounted) {
                 setState(() => _error = 'GPS tracking ruk gaya: $error');
+              }
             },
           );
       setState(() {
@@ -2118,8 +1659,68 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
     body: SafeArea(
       child: Column(
         children: [
-          SizedBox(
-            height: 240,
+          Card(
+            margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            color: const Color(0xFF151F2C),
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 22,
+                    child: Column(
+                      children: [
+                        const Icon(
+                          Icons.radio_button_unchecked,
+                          size: 16,
+                          color: Color(0xFF62D6B2),
+                        ),
+                        Container(width: 1, height: 18, color: Colors.white38),
+                        const Icon(
+                          Icons.location_on,
+                          size: 18,
+                          color: Color(0xFF7DE5E9),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      children: [
+                        _RoutePointField(
+                          text: _startPosition == null
+                              ? 'Getting your location…'
+                              : 'Your location · ${_startPosition!.latitude.toStringAsFixed(4)}, ${_startPosition!.longitude.toStringAsFixed(4)}',
+                          hint: 'Choose starting point',
+                          highlighted: true,
+                          icon: Icons.my_location,
+                          onTap: _recording || _finished
+                              ? null
+                              : _prepareCurrentLocation,
+                        ),
+                        const SizedBox(height: 8),
+                        _RoutePointField(
+                          text: _destination == null
+                              ? ''
+                              : '${_destination!.latitude.toStringAsFixed(4)}, ${_destination!.longitude.toStringAsFixed(4)}',
+                          hint: 'Choose destination…',
+                          icon: Icons.search,
+                          onTap: _recording || _finished
+                              ? null
+                              : _openDestinationPicker,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.swap_vert, color: Colors.white70, size: 22),
+                ],
+              ),
+            ),
+          ),
+          Expanded(
+            flex: 4,
             child: Stack(
               children: [
                 MapLibreMap(
@@ -2136,9 +1737,7 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
                   myLocationEnabled: false,
                   onMapCreated: (controller) => _mapController = controller,
                   onStyleLoadedCallback: _onMapStyleLoaded,
-                  onMapClick: (_, coordinates) {
-                    _openRoutePlanner();
-                  },
+                  onMapClick: (_, __) => _openDestinationPicker(),
                   attributionButtonPosition:
                       AttributionButtonPosition.bottomLeft,
                 ),
@@ -2177,8 +1776,8 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
                         _recording
                             ? 'LIVE · blue route / green travelled path'
                             : _destination == null
-                            ? 'Tap the map to choose destination'
-                            : 'Tap another point to change destination',
+                            ? 'Tap to open full-screen map'
+                            : 'Tap to change destination on full-screen map',
                         style: const TextStyle(fontSize: 12),
                       ),
                     ),
@@ -2217,19 +1816,6 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Text(
-                    _startPosition == null
-                        ? 'Getting your GPS start point…'
-                        : 'From: ${_startPosition!.latitude.toStringAsFixed(5)}, ${_startPosition!.longitude.toStringAsFixed(5)}',
-                    style: const TextStyle(color: Colors.white70),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _destination == null
-                        ? 'To: tap a destination on the map'
-                        : 'To: ${_destination!.latitude.toStringAsFixed(5)}, ${_destination!.longitude.toStringAsFixed(5)}',
-                    style: const TextStyle(color: Colors.white70),
-                  ),
                   const SizedBox(height: 10),
                   Wrap(
                     spacing: 8,
@@ -2283,12 +1869,6 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
                       ),
                   ],
                   const SizedBox(height: 8),
-                  if (!_recording && !_finished)
-                    OutlinedButton.icon(
-                      onPressed: _openRoutePlanner,
-                      icon: const Icon(Icons.fullscreen),
-                      label: const Text('Open full map'),
-                    ),
                   if (!_recording && !_finished)
                     FilledButton.icon(
                       onPressed: _busy || _routeLoading || _destination == null
@@ -2400,285 +1980,240 @@ class _RoadReviewCaptureScreenState extends State<RoadReviewCaptureScreen> {
   );
 }
 
-class RoutePlannerScreen extends StatefulWidget {
-  final LatLng startLocation;
-
-  const RoutePlannerScreen({super.key, required this.startLocation});
-
-  @override
-  State<RoutePlannerScreen> createState() => _RoutePlannerScreenState();
-}
-
-class _RoutePlannerScreenState extends State<RoutePlannerScreen> {
-  MapLibreMapController? _mapController;
-  LatLng? _selectedDestination;
-  final TextEditingController _destinationController = TextEditingController();
-  bool _searching = false;
-  List<Map<String, dynamic>> _searchResults = [];
-
-  @override
-  void dispose() {
-    _destinationController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _searchDestination() async {
-    final query = _destinationController.text.trim();
-    if (query.isEmpty) return;
-
-    setState(() {
-      _searching = true;
-      _searchResults = [];
-    });
-
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 10);
-    try {
-      final uri = Uri.parse(
-        'https://nominatim.openstreetmap.org/search'
-        '?q=${Uri.encodeComponent(query)}'
-        '&format=jsonv2'
-        '&limit=5'
-        '&countrycodes=in',
-      );
-      final request = await client
-          .getUrl(uri)
-          .timeout(const Duration(seconds: 12));
-      request.headers.set(
-        HttpHeaders.userAgentHeader,
-        'AIpotholeDetection/1.0',
-      );
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-
-      final response = await request.close();
-      final body = await utf8.decoder.bind(response).join();
-      if (response.statusCode != HttpStatus.ok) {
-        throw Exception('Destination search failed.');
-      }
-
-      final results = jsonDecode(body) as List<dynamic>;
-      if (!mounted) return;
-      setState(() {
-        _searchResults = results
-            .map((item) => Map<String, dynamic>.from(item as Map))
-            .toList();
-        _searching = false;
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() => _searching = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Destination search failed: $error')),
-      );
-    } finally {
-      client.close(force: true);
-    }
-  }
-
-  void _selectSearchResult(Map<String, dynamic> result) {
-    final latitude = double.tryParse(result['lat']?.toString() ?? '');
-    final longitude = double.tryParse(result['lon']?.toString() ?? '');
-    if (latitude == null || longitude == null) return;
-
-    final location = LatLng(latitude, longitude);
-    setState(() {
-      _selectedDestination = location;
-      _destinationController.text = result['display_name']?.toString() ?? '';
-      _searchResults = [];
-    });
-    _mapController?.animateCamera(CameraUpdate.newLatLngZoom(location, 16));
-  }
-
-  void _selectMapDestination(LatLng location) {
-    setState(() {
-      _selectedDestination = location;
-      _searchResults = [];
-      _destinationController.text =
-          '${location.latitude.toStringAsFixed(6)}, '
-          '${location.longitude.toStringAsFixed(6)}';
-    });
-  }
-
-  void _useDestination() {
-    final destination = _selectedDestination;
-    if (destination == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Pehle destination select karein.')),
-      );
-      return;
-    }
-    Navigator.of(context).pop(destination);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF0B1220),
-      appBar: AppBar(
-        title: const Text('Plan your road review'),
-        backgroundColor: const Color(0xFF0B1220),
-        foregroundColor: Colors.white,
-      ),
-      body: Stack(
-        children: [
-          MapLibreMap(
-            styleString: 'https://tiles.openfreemap.org/styles/liberty',
-            initialCameraPosition: CameraPosition(
-              target: widget.startLocation,
-              zoom: 15,
-            ),
-            myLocationEnabled: true,
-            onMapCreated: (controller) => _mapController = controller,
-            onMapClick: (_, coordinates) => _selectMapDestination(coordinates),
-            attributionButtonPosition: AttributionButtonPosition.bottomLeft,
-          ),
-          Positioned(
-            top: 12,
-            left: 12,
-            right: 12,
-            child: Column(
-              children: [
-                Card(
-                  color: const Color(0xFFF7F7F7),
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(
-                      children: [
-                        TextField(
-                          readOnly: true,
-                          controller: TextEditingController(
-                            text:
-                                '${widget.startLocation.latitude.toStringAsFixed(5)}, ${widget.startLocation.longitude.toStringAsFixed(5)}',
-                          ),
-                          decoration: const InputDecoration(
-                            prefixIcon: Icon(
-                              Icons.my_location,
-                              color: Colors.green,
-                            ),
-                            labelText: 'From',
-                            hintText: 'Current location',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-                        TextField(
-                          controller: _destinationController,
-                          textInputAction: TextInputAction.search,
-                          onSubmitted: (_) => _searchDestination(),
-                          decoration: InputDecoration(
-                            prefixIcon: const Icon(
-                              Icons.location_on,
-                              color: Colors.red,
-                            ),
-                            suffixIcon: IconButton(
-                              onPressed: _searching ? null : _searchDestination,
-                              icon: _searching
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(Icons.search),
-                            ),
-                            labelText: 'To',
-                            hintText: 'Search destination...',
-                            border: const OutlineInputBorder(),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        const Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            'Search a place or tap anywhere on the map',
-                            style: TextStyle(
-                              color: Colors.black54,
-                              fontSize: 12,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                if (_searchResults.isNotEmpty)
-                  Card(
-                    color: const Color(0xFFF7F7F7),
-                    child: ListView.separated(
-                      shrinkWrap: true,
-                      padding: EdgeInsets.zero,
-                      itemCount: _searchResults.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (context, index) {
-                        final result = _searchResults[index];
-                        return ListTile(
-                          leading: const Icon(Icons.place, color: Colors.red),
-                          title: Text(
-                            result['display_name']?.toString() ??
-                                'Unknown place',
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Colors.black87,
-                              fontSize: 13,
-                            ),
-                          ),
-                          onTap: () => _selectSearchResult(result),
-                        );
-                      },
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 18,
-            child: Card(
-              color: const Color(0xFF111827),
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text(
-                      _selectedDestination == null
-                          ? 'Select a destination'
-                          : 'Destination selected',
-                      style: TextStyle(
-                        color: _selectedDestination == null
-                            ? Colors.white70
-                            : const Color(0xFF62D6B2),
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    FilledButton.icon(
-                      onPressed: _selectedDestination == null
-                          ? null
-                          : _useDestination,
-                      icon: const Icon(Icons.route),
-                      label: const Text('Use this destination'),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 String _formatTripDuration(int seconds) {
   final duration = Duration(seconds: seconds);
   final hours = duration.inHours.toString().padLeft(2, '0');
   final minutes = (duration.inMinutes % 60).toString().padLeft(2, '0');
   final remainingSeconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
   return '$hours:$minutes:$remainingSeconds';
+}
+
+class _RoutePointField extends StatelessWidget {
+  final String text;
+  final String hint;
+  final IconData icon;
+  final bool highlighted;
+  final VoidCallback? onTap;
+
+  const _RoutePointField({
+    required this.text,
+    required this.hint,
+    required this.icon,
+    required this.onTap,
+    this.highlighted = false,
+  });
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: Colors.transparent,
+    child: InkWell(
+      borderRadius: BorderRadius.circular(9),
+      onTap: onTap,
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 46),
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0C1521),
+          borderRadius: BorderRadius.circular(9),
+          border: Border.all(
+            color: highlighted ? const Color(0xFF00C7D9) : Colors.white24,
+            width: highlighted ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                text.isEmpty ? hint : text,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: text.isEmpty ? Colors.white54 : Colors.white,
+                  fontSize: 14,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Icon(icon, size: 20, color: const Color(0xFF00C7D9)),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+class RoadDestinationPickerScreen extends StatefulWidget {
+  final LatLng startLocation;
+  final LatLng? initialDestination;
+
+  const RoadDestinationPickerScreen({
+    super.key,
+    required this.startLocation,
+    this.initialDestination,
+  });
+
+  @override
+  State<RoadDestinationPickerScreen> createState() =>
+      _RoadDestinationPickerScreenState();
+}
+
+class _RoadDestinationPickerScreenState
+    extends State<RoadDestinationPickerScreen> {
+  MapLibreMapController? _controller;
+  LatLng? _destination;
+
+  @override
+  void initState() {
+    super.initState();
+    _destination = widget.initialDestination;
+  }
+
+  Future<void> _setDestination(LatLng point) async {
+    setState(() => _destination = point);
+    final controller = _controller;
+    if (controller == null) return;
+    try {
+      await controller.clearCircles();
+      await controller.addCircle(
+        CircleOptions(
+          geometry: widget.startLocation,
+          circleRadius: 8,
+          circleColor: '#22c55e',
+          circleStrokeColor: '#ffffff',
+          circleStrokeWidth: 2,
+        ),
+      );
+      await controller.addCircle(
+        CircleOptions(
+          geometry: point,
+          circleRadius: 10,
+          circleColor: '#38bdf8',
+          circleStrokeColor: '#ffffff',
+          circleStrokeWidth: 3,
+        ),
+      );
+    } catch (error) {
+      debugPrint('Could not draw road destination markers: $error');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Choose destination')),
+    body: Stack(
+      children: [
+        MapLibreMap(
+          styleString: 'https://tiles.openfreemap.org/styles/liberty',
+          initialCameraPosition: CameraPosition(
+            target: _destination ?? widget.startLocation,
+            zoom: _destination == null ? 14 : 15,
+          ),
+          myLocationEnabled: true,
+          onMapCreated: (controller) => _controller = controller,
+          onStyleLoadedCallback: () {
+            if (_destination != null) {
+              _setDestination(_destination!);
+            } else {
+              final controller = _controller;
+              if (controller != null) {
+                unawaited(
+                  controller.addCircle(
+                    CircleOptions(
+                      geometry: widget.startLocation,
+                      circleRadius: 8,
+                      circleColor: '#22c55e',
+                      circleStrokeColor: '#ffffff',
+                      circleStrokeWidth: 2,
+                    ),
+                  ),
+                );
+              }
+            }
+          },
+          onMapClick: (_, point) => _setDestination(point),
+          attributionButtonPosition: AttributionButtonPosition.bottomLeft,
+        ),
+        Positioned(
+          left: 12,
+          right: 12,
+          top: 12,
+          child: Card(
+            color: const Color(0xF0101722),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.my_location,
+                        color: Color(0xFF62D6B2),
+                        size: 19,
+                      ),
+                      const SizedBox(width: 9),
+                      const Expanded(child: Text('Your location')),
+                      Text(
+                        '${widget.startLocation.latitude.toStringAsFixed(4)}, ${widget.startLocation.longitude.toStringAsFixed(4)}',
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.only(left: 9),
+                    child: SizedBox(
+                      height: 13,
+                      child: VerticalDivider(width: 1, color: Colors.white38),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.location_on_outlined,
+                        color: Color(0xFF7DE5E9),
+                        size: 19,
+                      ),
+                      const SizedBox(width: 9),
+                      const Text('Choose destination'),
+                      const Spacer(),
+                      Text(
+                        _destination == null
+                            ? 'Tap the map'
+                            : '${_destination!.latitude.toStringAsFixed(4)}, ${_destination!.longitude.toStringAsFixed(4)}',
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          left: 16,
+          right: 16,
+          bottom: 18,
+          child: FilledButton.icon(
+            onPressed: _destination == null
+                ? null
+                : () => Navigator.of(context).pop(_destination),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF167C78),
+              padding: const EdgeInsets.symmetric(vertical: 15),
+            ),
+            icon: const Icon(Icons.check),
+            label: const Text('Confirm destination'),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class ManualReportScreen extends StatefulWidget {
@@ -3135,11 +2670,13 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
   Future<void> _centerOnCurrentLocation() async {
     try {
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled)
+      if (!serviceEnabled) {
         throw Exception('Phone ki Location setting on karein.');
+      }
       var permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied)
+      if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
+      }
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
         throw Exception('App settings me Location permission allow karein.');
@@ -3168,7 +2705,34 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Road reports')),
+      appBar: AppBar(
+        title: const Text('Road reports'),
+        actions: [
+          PopupMenuButton<_RoadMapAction>(
+            tooltip: 'More app options',
+            onSelected: (action) => Navigator.of(context).pop(action),
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: _RoadMapAction.home, child: Text('Home')),
+              PopupMenuItem(
+                value: _RoadMapAction.reports,
+                child: Text('Reports'),
+              ),
+              PopupMenuItem(
+                value: _RoadMapAction.profile,
+                child: Text('Profile'),
+              ),
+              PopupMenuItem(
+                value: _RoadMapAction.manualReport,
+                child: Text('Report with GPS'),
+              ),
+              PopupMenuItem(
+                value: _RoadMapAction.roadReview,
+                child: Text('Review a road'),
+              ),
+            ],
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(
@@ -3300,18 +2864,59 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
   }
 }
 
-enum CameraAspectRatio { ratio1x1, ratio4x3, ratio16x9, full }
-
 class CameraScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
+  final double captureAspectRatio;
+  final String captureAspectLabel;
+  final bool smartMode;
 
-  const CameraScreen({super.key, required this.cameras});
+  const CameraScreen({
+    super.key,
+    required this.cameras,
+    required this.captureAspectRatio,
+    required this.captureAspectLabel,
+    this.smartMode = false,
+  });
 
   @override
   State<CameraScreen> createState() => _CameraScreenState();
 }
 
-class _CameraScreenState extends State<CameraScreen> {
+class _ScanLinePainter extends CustomPainter {
+  final double progress;
+
+  const _ScanLinePainter(this.progress);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final y = progress * size.height;
+    final glowPaint = Paint()
+      ..color = const Color(0x334BFF9A)
+      ..strokeWidth = 8
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
+    canvas.drawLine(Offset(0, y), Offset(size.width, y), glowPaint);
+
+    final linePaint = Paint()
+      ..shader = const LinearGradient(
+        colors: [
+          Color(0x004BFF9A),
+          Color(0xB34BFF9A),
+          Color(0xF0B3FFD1),
+          Color(0xB34BFF9A),
+          Color(0x004BFF9A),
+        ],
+      ).createShader(Rect.fromLTWH(0, y - 1, size.width, 2))
+      ..strokeWidth = 1.5;
+    canvas.drawLine(Offset(0, y), Offset(size.width, y), linePaint);
+  }
+
+  @override
+  bool shouldRepaint(_ScanLinePainter oldDelegate) =>
+      progress != oldDelegate.progress;
+}
+
+class _CameraScreenState extends State<CameraScreen>
+    with SingleTickerProviderStateMixin {
   Future<void> runYoloInference(_PreparedImage preparedImage) async {
     final inputTensor = OrtValueTensor.createTensorWithDataList(
       preparedImage.tensor,
@@ -3324,21 +2929,17 @@ class _CameraScreenState extends State<CameraScreen> {
 
     final outputs = await yoloSession.runAsync(runOptions, inputs);
 
-    debugPrint('YOLO INFERENCE SUCCESS');
-    debugPrint('OUTPUT COUNT: ${outputs?.length}');
     decodeYoloOutput(
       outputs!.first!.value as List<List<List<double>>>,
       preparedImage,
     );
-    debugPrint('OUTPUT VALUE TYPE: ${outputs.first!.value.runtimeType}');
-    debugPrint('OUTPUT VALUE: ${outputs.first!.value}');
 
     inputTensor.release();
     runOptions.release();
 
-    outputs.forEach((output) {
+    for (final output in outputs) {
       output?.release();
-    });
+    }
   }
 
   void decodeYoloOutput(
@@ -3452,14 +3053,10 @@ class _CameraScreenState extends State<CameraScreen> {
       }).toList();
     });
 
-    double maxConfidence = 0.0;
+    _announceDetection();
 
     for (final detection in finalDetections) {
       final double confidence = detection['confidence']!;
-
-      if (confidence > maxConfidence) {
-        maxConfidence = confidence;
-      }
 
       final double width = detection['right']! - detection['left']!;
       final double height = detection['bottom']! - detection['top']!;
@@ -3475,17 +3072,10 @@ class _CameraScreenState extends State<CameraScreen> {
         severity = 'SMALL';
       }
 
-      debugPrint('POTHOLE DETECTED');
-      debugPrint('Confidence: $confidence');
-      debugPrint('Severity: $severity');
       debugPrint(
-        'Box: ${detection['left']}, ${detection['top']}, '
-        '${detection['right']}, ${detection['bottom']}',
+        'AI pothole: ${(confidence * 100).toStringAsFixed(0)}% · $severity',
       );
     }
-
-    debugPrint('TOTAL POTHOLES: ${finalDetections.length}');
-    debugPrint('MAX CONFIDENCE: $maxConfidence');
   }
 
   double _calculateIoU(Map<String, double> a, Map<String, double> b) {
@@ -3524,8 +3114,49 @@ class _CameraScreenState extends State<CameraScreen> {
   Position? currentPosition;
   LatLng? _selectedPhotoPin;
   List<Map<String, dynamic>> detectedPotholes = [];
-  CameraAspectRatio _currentAspectRatio = CameraAspectRatio.ratio4x3;
-  bool _showRatioSettings = true;
+  late AnimationController _scanController;
+  StreamSubscription<Position>? _locationSubscription;
+  Timer? _smartUiTimer;
+  final Stopwatch _recordingClock = Stopwatch();
+  bool _isRecording = false;
+  bool _isPaused = false;
+  bool _videoBusy = false;
+  bool _scanActive = false;
+  bool _isFullscreen = false;
+  bool _alertsMuted = true;
+  bool _snapshotPending = false;
+  bool _snapshotSaving = false;
+  bool _closingSmartScreen = false;
+  String? _lastSnapshotPath;
+  String? _lastVideoPath;
+  String? _smartError;
+  double _fps = 0;
+  int _fpsFrames = 0;
+  DateTime _fpsWindowStart = DateTime.now();
+  DateTime _lastVoiceAlert = DateTime.fromMillisecondsSinceEpoch(0);
+
+  bool get _hasDetections => detectedPotholes.isNotEmpty;
+
+  String get _severityLabel {
+    if (detectedPotholes.any((item) => item['severity'] == 'LARGE')) {
+      return 'CRITICAL';
+    }
+    if (detectedPotholes.any((item) => item['severity'] == 'MEDIUM')) {
+      return 'WARNING';
+    }
+    return _hasDetections ? 'MONITOR' : 'CLEAR';
+  }
+
+  Color get _severityColor => switch (_severityLabel) {
+    'CRITICAL' => const Color(0xFFFF3B69),
+    'WARNING' => const Color(0xFFFFC857),
+    'MONITOR' => const Color(0xFF45D6F5),
+    _ => const Color(0xFF58E39B),
+  };
+
+  double get _topConfidence => _hasDetections
+      ? ((detectedPotholes.first['confidence'] as double) * 100)
+      : 0;
 
   img.Image convertCameraImage(CameraImage image) {
     final int width = image.width;
@@ -3674,12 +3305,10 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   ({double left, double top, double width, double height}) _previewBox(
-    Map<String, dynamic> detection, {
-    required double renderWidth,
-    required double renderHeight,
-    required double offsetX,
-    required double offsetY,
-  }) {
+    Map<String, dynamic> detection,
+    double previewWidth,
+    double previewHeight,
+  ) {
     final double sourceWidth = detection['sourceWidth'] as double;
     final double sourceHeight = detection['sourceHeight'] as double;
     final double left = detection['left'] as double;
@@ -3735,17 +3364,28 @@ class _CameraScreenState extends State<CameraScreen> {
       displayLeft = mirroredLeft;
     }
 
+    final coverScale = math.max(
+      previewWidth / displayWidth,
+      previewHeight / displayHeight,
+    );
+    final offsetX = (previewWidth - displayWidth * coverScale) / 2;
+    final offsetY = (previewHeight - displayHeight * coverScale) / 2;
+
     return (
-      left: offsetX + (displayLeft / displayWidth) * renderWidth,
-      top: offsetY + (displayTop / displayHeight) * renderHeight,
-      width: ((displayRight - displayLeft) / displayWidth) * renderWidth,
-      height: ((displayBottom - displayTop) / displayHeight) * renderHeight,
+      left: displayLeft * coverScale + offsetX,
+      top: displayTop * coverScale + offsetY,
+      width: (displayRight - displayLeft) * coverScale,
+      height: (displayBottom - displayTop) * coverScale,
     );
   }
 
   @override
   void initState() {
     super.initState();
+    _scanController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2100),
+    );
 
     final camera = widget.cameras.firstWhere(
       (camera) => camera.lensDirection == CameraLensDirection.back,
@@ -3757,7 +3397,16 @@ class _CameraScreenState extends State<CameraScreen> {
       enableAudio: false,
     );
 
-    cameraFuture = cameraController.initialize().then((_) => _startDetection());
+    cameraFuture = cameraController.initialize().then((_) async {
+      await _startDetection();
+      if (widget.smartMode && mounted) {
+        _setScanActive(true);
+        unawaited(_startLocationTracking());
+        _smartUiTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+          if (mounted) setState(() {});
+        });
+      }
+    });
   }
 
   Future<void> _startDetection() async {
@@ -3766,28 +3415,323 @@ class _CameraScreenState extends State<CameraScreen> {
       return;
     }
 
-    await cameraController.startImageStream((CameraImage image) async {
-      if (isProcessingFrame || _isCapturing || _capturedPhotoPath != null) {
-        return;
-      }
+    await cameraController.startImageStream(_onCameraImage);
+  }
 
-      isProcessingFrame = true;
-      try {
-        final convertedImage = convertCameraImage(image);
-        final preparedImage = imageToTensor(
-          convertedImage,
-          rotationDegrees: _frameRotationDegrees(),
-          mirrorHorizontally:
-              cameraController.description.lensDirection ==
-              CameraLensDirection.front,
-        );
-        await runYoloInference(preparedImage);
-      } catch (error) {
-        debugPrint('Could not process camera frame: $error');
-      } finally {
-        isProcessingFrame = false;
+  void _onCameraImage(CameraImage image) {
+    if (!mounted ||
+        isProcessingFrame ||
+        _isCapturing ||
+        _capturedPhotoPath != null ||
+        (widget.smartMode && _isPaused)) {
+      return;
+    }
+    isProcessingFrame = true;
+    unawaited(_processCameraImage(image));
+  }
+
+  Future<void> _processCameraImage(CameraImage image) async {
+    try {
+      final convertedImage = convertCameraImage(image);
+      if (widget.smartMode && _snapshotPending && !_snapshotSaving) {
+        _snapshotPending = false;
+        unawaited(_saveSmartSnapshot(convertedImage));
       }
+      final preparedImage = imageToTensor(
+        convertedImage,
+        rotationDegrees: _frameRotationDegrees(),
+        mirrorHorizontally:
+            cameraController.description.lensDirection ==
+            CameraLensDirection.front,
+      );
+      await runYoloInference(preparedImage);
+      if (widget.smartMode) {
+        _fpsFrames++;
+        final now = DateTime.now();
+        final elapsed = now.difference(_fpsWindowStart);
+        if (elapsed >= const Duration(seconds: 1)) {
+          _fps = _fpsFrames / elapsed.inMilliseconds * 1000;
+          _fpsFrames = 0;
+          _fpsWindowStart = now;
+        }
+      }
+    } catch (error) {
+      debugPrint('Could not process camera frame: $error');
+      if (widget.smartMode && mounted) {
+        setState(() => _smartError = 'AI frame processing paused: $error');
+      }
+    } finally {
+      isProcessingFrame = false;
+    }
+  }
+
+  Future<void> _startLocationTracking() async {
+    try {
+      final firstPosition = await _getPositionAfterCapture();
+      if (!mounted) return;
+      setState(() {
+        currentPosition = firstPosition;
+        _locationError = null;
+      });
+      _locationSubscription =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.bestForNavigation,
+              distanceFilter: 2,
+            ),
+          ).listen(
+            (position) {
+              if (mounted) setState(() => currentPosition = position);
+            },
+            onError: (Object error) {
+              if (mounted) setState(() => _locationError = error.toString());
+            },
+          );
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () =>
+              _locationError = error.toString().replaceFirst('Exception: ', ''),
+        );
+      }
+    }
+  }
+
+  void _setScanActive(bool active) {
+    if (_scanActive == active) return;
+    _scanActive = active;
+    if (active) {
+      _scanController.repeat();
+    } else {
+      _scanController.stop();
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _startSmartRecording() async {
+    if (_videoBusy || _isRecording || !cameraController.value.isInitialized) {
+      return;
+    }
+    setState(() {
+      _videoBusy = true;
+      _smartError = null;
+      _lastVideoPath = null;
     });
+    try {
+      if (cameraController.value.isStreamingImages) {
+        await cameraController.stopImageStream();
+      }
+      while (isProcessingFrame) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      await cameraController.startVideoRecording(onAvailable: _onCameraImage);
+      _recordingClock
+        ..reset()
+        ..start();
+      _fpsFrames = 0;
+      _fpsWindowStart = DateTime.now();
+      if (mounted) {
+        setState(() {
+          _isRecording = true;
+          _isPaused = false;
+        });
+      }
+      _setScanActive(true);
+    } catch (error) {
+      if (mounted) {
+        setState(() => _smartError = 'Recording could not start: $error');
+        try {
+          await _startDetection();
+        } catch (restartError) {
+          debugPrint('Could not restart AI camera stream: $restartError');
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _videoBusy = false);
+    }
+  }
+
+  Future<void> _toggleSmartPause() async {
+    if (!_isRecording || _videoBusy) return;
+    setState(() => _videoBusy = true);
+    try {
+      if (_isPaused) {
+        await cameraController.resumeVideoRecording();
+        _recordingClock.start();
+        if (mounted) setState(() => _isPaused = false);
+        _setScanActive(true);
+      } else {
+        await cameraController.pauseVideoRecording();
+        _recordingClock.stop();
+        if (mounted) setState(() => _isPaused = true);
+        _setScanActive(false);
+      }
+    } catch (error) {
+      if (mounted)
+        setState(
+          () => _smartError = 'Could not change recording state: $error',
+        );
+    } finally {
+      if (mounted) setState(() => _videoBusy = false);
+    }
+  }
+
+  Future<void> _stopSmartRecording({bool restartDetection = true}) async {
+    if (!_isRecording || _videoBusy) return;
+    setState(() => _videoBusy = true);
+    _recordingClock.stop();
+    try {
+      final recordedFile = await cameraController.stopVideoRecording();
+      if (mounted) {
+        setState(() {
+          _isRecording = false;
+          _isPaused = false;
+        });
+      }
+      final directoryPath = await _roadAppChannel.invokeMethod<String>(
+        'getRoadVideoDirectory',
+      );
+      if (directoryPath == null) {
+        throw Exception('Phone video storage is unavailable.');
+      }
+      final directory = Directory(directoryPath);
+      await directory.create(recursive: true);
+      final destination = File(
+        '${directory.path}${Platform.pathSeparator}'
+        'road_scan_${DateTime.now().millisecondsSinceEpoch}.mp4',
+      );
+      await File(recordedFile.path).copy(destination.path);
+      try {
+        await File(recordedFile.path).delete();
+      } catch (_) {
+        // The camera plugin may already have removed its temporary recording.
+      }
+      if (mounted) {
+        setState(() {
+          _lastVideoPath = destination.path;
+          _isRecording = false;
+          _isPaused = false;
+          _smartError = null;
+        });
+      }
+      if (restartDetection && mounted && !_closingSmartScreen) {
+        await _startDetection();
+        _setScanActive(true);
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() => _smartError = 'Recording could not be saved: $error');
+      }
+    } finally {
+      if (mounted) setState(() => _videoBusy = false);
+    }
+  }
+
+  Future<void> _saveSmartSnapshot(img.Image frame) async {
+    if (mounted) setState(() => _snapshotSaving = true);
+    try {
+      final photoDirectory = await _roadAppChannel.invokeMethod<String>(
+        'getRoadPhotoDirectory',
+      );
+      if (photoDirectory == null) {
+        throw Exception('Phone snapshot storage is unavailable.');
+      }
+      final directory = Directory(photoDirectory);
+      await directory.create(recursive: true);
+      final file = File(
+        '${directory.path}${Platform.pathSeparator}'
+        'scan_${DateTime.now().millisecondsSinceEpoch}.jpg',
+      );
+      await file.writeAsBytes(img.encodeJpg(frame, quality: 90));
+      if (mounted) {
+        setState(() {
+          _lastSnapshotPath = file.path;
+          _smartError = null;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Snapshot saved on this phone.')),
+        );
+      }
+    } catch (error) {
+      if (mounted) setState(() => _smartError = 'Snapshot failed: $error');
+    } finally {
+      if (mounted) setState(() => _snapshotSaving = false);
+    }
+  }
+
+  void _requestSmartSnapshot() {
+    if (_isPaused || _snapshotSaving || _snapshotPending) return;
+    if (!cameraController.value.isStreamingImages) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Start live detection before taking a snapshot.'),
+        ),
+      );
+      return;
+    }
+    setState(() => _snapshotPending = true);
+  }
+
+  Future<void> _toggleVoiceAlerts() async {
+    final muted = !_alertsMuted;
+    setState(() => _alertsMuted = muted);
+    if (muted) {
+      try {
+        await _roadAppChannel.invokeMethod<bool>('stopVoiceAlert');
+      } catch (_) {
+        // Muting voice alerts should still update the on-screen state.
+      }
+    } else if (_hasDetections) {
+      _announceDetection();
+    }
+  }
+
+  void _announceDetection() {
+    final now = DateTime.now();
+    if (!widget.smartMode ||
+        _alertsMuted ||
+        !_hasDetections ||
+        now.difference(_lastVoiceAlert) < const Duration(seconds: 15)) {
+      return;
+    }
+    _lastVoiceAlert = now;
+    unawaited(
+      _roadAppChannel
+          .invokeMethod<bool>('speakVoiceAlert', {
+            'message': _severityLabel == 'CRITICAL'
+                ? 'Critical road pothole detected ahead.'
+                : 'Road surface hazard detected ahead.',
+          })
+          .catchError((_) => false),
+    );
+  }
+
+  Future<void> _toggleFullscreen() async {
+    final fullscreen = !_isFullscreen;
+    await SystemChrome.setEnabledSystemUIMode(
+      fullscreen ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+    if (mounted) setState(() => _isFullscreen = fullscreen);
+  }
+
+  Future<void> _closeSmartScreen() async {
+    if (_closingSmartScreen) return;
+    _closingSmartScreen = true;
+    while (_videoBusy) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    if (_isRecording) {
+      await _stopSmartRecording(restartDetection: false);
+    }
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  String get _recordingTimeLabel {
+    final elapsed = _recordingClock.elapsed;
+    final minutes = elapsed.inMinutes.toString().padLeft(2, '0');
+    final seconds = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
   }
 
   Future<Position> _getPositionAfterCapture() async {
@@ -3823,7 +3767,29 @@ class _CameraScreenState extends State<CameraScreen> {
       '${directory.path}${Platform.pathSeparator}'
       'road_${DateTime.now().millisecondsSinceEpoch}.jpg',
     );
-    await File(sourcePath).copy(savedFile.path);
+    final decoded = img.decodeImage(await File(sourcePath).readAsBytes());
+    if (decoded == null) {
+      throw Exception('The camera returned an unreadable photo.');
+    }
+    final oriented = img.bakeOrientation(decoded);
+    final sourceAspect = oriented.width / oriented.height;
+    late final int cropWidth;
+    late final int cropHeight;
+    if (sourceAspect > widget.captureAspectRatio) {
+      cropHeight = oriented.height;
+      cropWidth = (cropHeight * widget.captureAspectRatio).round();
+    } else {
+      cropWidth = oriented.width;
+      cropHeight = (cropWidth / widget.captureAspectRatio).round();
+    }
+    final cropped = img.copyCrop(
+      oriented,
+      x: (oriented.width - cropWidth) ~/ 2,
+      y: (oriented.height - cropHeight) ~/ 2,
+      width: cropWidth,
+      height: cropHeight,
+    );
+    await savedFile.writeAsBytes(img.encodeJpg(cropped, quality: 95));
     return savedFile.path;
   }
 
@@ -3980,813 +3946,811 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
-  @override
-  void dispose() {
-    cameraController.dispose();
-    super.dispose();
+  String get _detectionStatusLabel {
+    if (_isRecording && _isPaused) return 'RECORDING PAUSED';
+    if (_isRecording) return 'RECORDING · LIVE AI';
+    if (_scanActive) return 'LIVE AI SCANNING';
+    return 'DETECTION STOPPED';
   }
 
-  PopupMenuItem<CameraAspectRatio> _buildPopupMenuItem(
-    CameraAspectRatio ratio,
-    String label,
-    String subtitle,
-  ) {
-    final isSelected = _currentAspectRatio == ratio;
-    return PopupMenuItem<CameraAspectRatio>(
-      value: ratio,
-      child: Row(
-        children: [
-          Icon(
-            isSelected ? Icons.check_circle : Icons.circle_outlined,
-            color: isSelected ? const Color(0xFF26C6DA) : Colors.white38,
-            size: 18,
-          ),
-          const SizedBox(width: 10),
-          Text(
-            label,
-            style: TextStyle(
-              fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
-              color: isSelected ? const Color(0xFF7DE5E9) : Colors.white,
-              fontSize: 14,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            subtitle,
-            style: const TextStyle(color: Colors.white54, fontSize: 12),
-          ),
-        ],
+  Widget _buildSmartPreview(double width) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final previewWidth = constraints.maxWidth;
+          final previewHeight = constraints.maxHeight;
+          final sensorPreviewAspect = 1 / cameraController.value.aspectRatio;
+          final compactWidth = math.min(220.0, previewWidth * .53).toDouble();
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: sensorPreviewAspect * 1000,
+                  height: 1000,
+                  child: CameraPreview(cameraController),
+                ),
+              ),
+              ...detectedPotholes.map((pothole) {
+                final box = _previewBox(pothole, previewWidth, previewHeight);
+                final severity = pothole['severity'] as String? ?? 'SMALL';
+                final color = severity == 'LARGE'
+                    ? const Color(0xFFFF3B69)
+                    : severity == 'MEDIUM'
+                    ? const Color(0xFFFFC857)
+                    : const Color(0xFF45D6F5);
+                return Positioned(
+                  left: box.left,
+                  top: box.top,
+                  width: box.width,
+                  height: box.height,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: color, width: 2),
+                    ),
+                    child: Align(
+                      alignment: Alignment.topLeft,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 2,
+                        ),
+                        color: color,
+                        child: Text(
+                          'POTHOLE ${((pothole['confidence'] as double) * 100).toStringAsFixed(0)}%',
+                          maxLines: 1,
+                          style: const TextStyle(
+                            color: Color(0xFF07131B),
+                            fontSize: 8,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }),
+              if (_scanActive)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: AnimatedBuilder(
+                      animation: _scanController,
+                      builder: (context, _) => CustomPaint(
+                        painter: _ScanLinePainter(_scanController.value),
+                      ),
+                    ),
+                  ),
+                ),
+              Positioned(
+                left: 10,
+                top: 10,
+                child: _buildCompactDetectionCard(compactWidth),
+              ),
+              Positioned(
+                right: 4,
+                top: 2,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _buildHudStatusChip(),
+                    if (_isFullscreen) ...[
+                      IconButton(
+                        tooltip: _alertsMuted
+                            ? 'Turn on voice alerts'
+                            : 'Mute voice alerts',
+                        onPressed: _toggleVoiceAlerts,
+                        visualDensity: VisualDensity.compact,
+                        color: _alertsMuted
+                            ? Colors.white70
+                            : const Color(0xFF58E39B),
+                        icon: Icon(
+                          _alertsMuted ? Icons.volume_off : Icons.volume_up,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Close live detection',
+                        onPressed: _closeSmartScreen,
+                        visualDensity: VisualDensity.compact,
+                        color: Colors.white,
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Positioned(
+                left: 10,
+                bottom: 10,
+                child: _buildCompactHazardCard(compactWidth),
+              ),
+              if (_isFullscreen)
+                Positioned(
+                  right: 10,
+                  bottom: 76,
+                  child: FloatingActionButton.small(
+                    heroTag: 'exit-smart-fullscreen',
+                    onPressed: _toggleFullscreen,
+                    backgroundColor: const Color(0xDD0A1420),
+                    foregroundColor: const Color(0xFF4BE8F3),
+                    child: const Icon(Icons.fullscreen_exit),
+                  ),
+                ),
+            ],
+          );
+        },
       ),
     );
   }
 
-  Widget _buildSettingsButton() {
-    final currentLabel = switch (_currentAspectRatio) {
-      CameraAspectRatio.ratio1x1 => '(1:1)',
-      CameraAspectRatio.ratio4x3 => '(4:3)',
-      CameraAspectRatio.ratio16x9 => '(16:9)',
-      CameraAspectRatio.full => '(full)',
-    };
-
-    return Row(
+  Widget _buildCompactDetectionCard(double width) => Container(
+    width: width,
+    padding: const EdgeInsets.all(8),
+    decoration: BoxDecoration(
+      color: const Color(0xE90A1420),
+      borderRadius: BorderRadius.circular(9),
+      border: Border.all(color: const Color(0xFF00DCEB).withValues(alpha: .7)),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Quick ratio badge: tap toggles segment bar
-        InkWell(
-          onTap: () {
-            setState(() {
-              _showRatioSettings = !_showRatioSettings;
-            });
-          },
-          borderRadius: BorderRadius.circular(20),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: _showRatioSettings
-                  ? const Color(0xFF26C6DA).withValues(alpha: 0.2)
-                  : Colors.white.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(
-                color: _showRatioSettings
-                    ? const Color(0xFF26C6DA)
-                    : Colors.white24,
-                width: 1,
-              ),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  currentLabel,
-                  style: TextStyle(
-                    color: _showRatioSettings
-                        ? const Color(0xFF7DE5E9)
-                        : Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(width: 4),
-                Icon(
-                  _showRatioSettings
-                      ? Icons.keyboard_arrow_up
-                      : Icons.keyboard_arrow_down,
-                  color: _showRatioSettings
-                      ? const Color(0xFF7DE5E9)
-                      : Colors.white70,
-                  size: 16,
-                ),
-              ],
+        Text(
+          _hasDetections
+              ? 'DEFECT · ${detectedPotholes.length}'
+              : 'AI ROAD SCAN',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Color(0xFF54EAF4),
+            fontSize: 10,
+            fontWeight: FontWeight.w900,
+            letterSpacing: .4,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          _hasDetections
+              ? 'Pothole · ${_topConfidence.toStringAsFixed(0)}% confidence'
+              : 'No road defect in this frame',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Colors.white, fontSize: 9),
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildHudStatusChip() => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+    decoration: BoxDecoration(
+      color: const Color(0xE90A1420),
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: _severityColor.withValues(alpha: .8)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.circle, size: 7, color: _severityColor),
+        const SizedBox(width: 5),
+        Text(
+          _detectionStatusLabel,
+          style: const TextStyle(fontSize: 8, fontWeight: FontWeight.w900),
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildCompactHazardCard(double width) => Container(
+    width: width,
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+    decoration: BoxDecoration(
+      color: const Color(0xE90A1420),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: _severityColor.withValues(alpha: .8)),
+    ),
+    child: Row(
+      children: [
+        Icon(
+          _hasDetections
+              ? Icons.warning_amber_rounded
+              : Icons.verified_outlined,
+          color: _severityColor,
+          size: 18,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            _hasDetections
+                ? 'HAZARD · $_severityLabel · ${detectedPotholes.length} ahead'
+                : 'ROAD STATUS · CLEAR',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: _severityColor,
+              fontSize: 10,
+              fontWeight: FontWeight.w900,
             ),
           ),
         ),
-        const SizedBox(width: 6),
-        // Small Settings logo: tap opens popup menu with all aspect ratio options
-        PopupMenuButton<CameraAspectRatio>(
-          tooltip: 'Camera Aspect Ratio Settings',
-          icon: Container(
-            padding: const EdgeInsets.all(7),
-            decoration: BoxDecoration(
-              color: _showRatioSettings
-                  ? const Color(0xFF26C6DA).withValues(alpha: 0.2)
-                  : Colors.white.withValues(alpha: 0.1),
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: _showRatioSettings
-                    ? const Color(0xFF26C6DA)
-                    : Colors.white24,
-                width: 1,
-              ),
-            ),
-            child: const Icon(
-              Icons.settings_outlined,
+        if (_isRecording)
+          Text(
+            _recordingTimeLabel,
+            style: const TextStyle(
               color: Colors.white,
-              size: 19,
+              fontFeatures: [FontFeature.tabularFigures()],
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
             ),
           ),
-          color: const Color(0xFF101928),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFF26C6DA), width: 1.2),
-          ),
-          offset: const Offset(0, 44),
-          initialValue: _currentAspectRatio,
-          onSelected: (CameraAspectRatio ratio) {
-            setState(() {
-              _currentAspectRatio = ratio;
-            });
-          },
-          itemBuilder: (context) => [
-            const PopupMenuItem(
-              enabled: false,
-              height: 32,
-              child: Text(
-                'FRAME ASPECT RATIO',
-                style: TextStyle(
-                  fontSize: 10,
+      ],
+    ),
+  );
+
+  Widget _buildSmartMetric(
+    String label,
+    String value,
+    IconData icon, {
+    Color color = const Color(0xFF43DAE9),
+  }) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
+    decoration: BoxDecoration(
+      color: const Color(0xFF0D1722),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: const Color(0xFF1D3543)),
+    ),
+    child: Row(
+      children: [
+        Icon(icon, size: 16, color: color),
+        const SizedBox(width: 7),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label.toUpperCase(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 8,
+                  letterSpacing: .5,
                   fontWeight: FontWeight.w800,
-                  letterSpacing: 1.2,
-                  color: Color(0xFF26C6DA),
                 ),
               ),
-            ),
-            const PopupMenuDivider(height: 1),
-            _buildPopupMenuItem(CameraAspectRatio.ratio1x1, '(1:1)', 'Square'),
-            _buildPopupMenuItem(
-              CameraAspectRatio.ratio4x3,
-              '(4:3)',
-              'Standard (Default)',
-            ),
-            _buildPopupMenuItem(
-              CameraAspectRatio.ratio16x9,
-              '(16:9)',
-              'Cinematic 16:9',
-            ),
-            _buildPopupMenuItem(
-              CameraAspectRatio.full,
-              '(full)',
-              'Full Screen',
-            ),
-          ],
+              const SizedBox(height: 2),
+              Text(
+                value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildSmartMetrics(double width) {
+    final tileWidth = width >= 700 ? (width - 36) / 4 : (width - 30) / 2;
+    final position = currentPosition;
+    final gpsLabel = position == null
+        ? (_locationError == null ? 'GPS WAIT' : 'GPS OFF')
+        : '${position.latitude.toStringAsFixed(4)}, ${position.longitude.toStringAsFixed(4)}';
+    final speedLabel = position == null
+        ? '-- km/h'
+        : '${(position.speed * 3.6).clamp(0, 300).toStringAsFixed(0)} km/h';
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        SizedBox(
+          width: tileWidth,
+          child: _buildSmartMetric(
+            'Detections',
+            '${detectedPotholes.length}',
+            Icons.center_focus_strong,
+          ),
+        ),
+        SizedBox(
+          width: tileWidth,
+          child: _buildSmartMetric(
+            'Speed',
+            speedLabel,
+            Icons.speed,
+            color: const Color(0xFF8FE8B3),
+          ),
+        ),
+        SizedBox(
+          width: tileWidth,
+          child: _buildSmartMetric(
+            'GPS',
+            gpsLabel,
+            Icons.my_location,
+            color: const Color(0xFF8FE8B3),
+          ),
+        ),
+        SizedBox(
+          width: tileWidth,
+          child: _buildSmartMetric(
+            'FPS / Confidence',
+            '${_fps.toStringAsFixed(1)} / ${_topConfidence.toStringAsFixed(0)}%',
+            Icons.memory,
+            color: const Color(0xFFFFC857),
+          ),
         ),
       ],
     );
   }
 
-  Widget _buildSegmentItem(CameraAspectRatio ratio, String label) {
-    final isSelected = _currentAspectRatio == ratio;
-    return Expanded(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () {
-          setState(() {
-            _currentAspectRatio = ratio;
-          });
-        },
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 180),
-          padding: const EdgeInsets.symmetric(vertical: 7),
-          decoration: BoxDecoration(
-            color: isSelected ? const Color(0xFF26C6DA) : Colors.transparent,
-            borderRadius: BorderRadius.circular(20),
+  Widget _buildSmartControls() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      if (!_isRecording)
+        FilledButton.icon(
+          onPressed: _videoBusy ? null : _startSmartRecording,
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFF00DCEB),
+            foregroundColor: const Color(0xFF07131B),
+            padding: const EdgeInsets.symmetric(vertical: 13),
           ),
-          child: Center(
-            child: Text(
-              label,
-              style: TextStyle(
-                color: isSelected ? const Color(0xFF041421) : Colors.white70,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
-                fontSize: 13,
-                letterSpacing: 0.2,
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSegmentBar() {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 2, 16, 8),
-      padding: const EdgeInsets.all(4),
-      decoration: BoxDecoration(
-        color: const Color(0xFF131D2D),
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: const Color(0xFF26C6DA).withValues(alpha: 0.35),
-          width: 1.2,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.35),
-            blurRadius: 8,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          _buildSegmentItem(CameraAspectRatio.ratio1x1, '(1:1)'),
-          _buildSegmentItem(CameraAspectRatio.ratio4x3, '(4:3)'),
-          _buildSegmentItem(CameraAspectRatio.ratio16x9, '(16:9)'),
-          _buildSegmentItem(CameraAspectRatio.full, '(full)'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTopBar() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      child: Row(
-        children: [
-          InkWell(
-            onTap: () => Navigator.of(context).pop(),
-            borderRadius: BorderRadius.circular(20),
-            child: Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.12),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.arrow_back_ios_new_rounded,
-                color: Colors.white,
-                size: 18,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Row(
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color: detectedPotholes.isNotEmpty
-                        ? const Color(0xFFFF5252)
-                        : const Color(0xFF00E676),
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color:
-                            (detectedPotholes.isNotEmpty
-                                    ? const Color(0xFFFF5252)
-                                    : const Color(0xFF00E676))
-                                .withValues(alpha: 0.8),
-                        blurRadius: 6,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  detectedPotholes.isNotEmpty
-                      ? '${detectedPotholes.length} Pothole${detectedPotholes.length > 1 ? 's' : ''}'
-                      : 'AI Camera',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.2,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          _buildSettingsButton(),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildViewfinder(double availableWidth, double availableHeight) {
-    final cameraValue = cameraController.value;
-    final double cameraNativeAspect = 1.0 / cameraValue.aspectRatio;
-
-    double targetAspect;
-    switch (_currentAspectRatio) {
-      case CameraAspectRatio.ratio1x1:
-        targetAspect = 1.0;
-        break;
-      case CameraAspectRatio.ratio4x3:
-        targetAspect = 3.0 / 4.0;
-        break;
-      case CameraAspectRatio.ratio16x9:
-        targetAspect = 9.0 / 16.0;
-        break;
-      case CameraAspectRatio.full:
-        targetAspect = availableWidth / availableHeight;
-        break;
-    }
-
-    double vWidth;
-    double vHeight;
-
-    if (_currentAspectRatio == CameraAspectRatio.full) {
-      vWidth = availableWidth;
-      vHeight = availableHeight;
-    } else {
-      vWidth = availableWidth;
-      vHeight = vWidth / targetAspect;
-
-      if (vHeight > availableHeight) {
-        vHeight = availableHeight;
-        vWidth = vHeight * targetAspect;
-      }
-    }
-
-    final double containerAspect = vWidth / vHeight;
-    double renderWidth;
-    double renderHeight;
-
-    if (containerAspect > cameraNativeAspect) {
-      renderWidth = vWidth;
-      renderHeight = vWidth / cameraNativeAspect;
-    } else {
-      renderHeight = vHeight;
-      renderWidth = vHeight * cameraNativeAspect;
-    }
-
-    final double offsetX = (vWidth - renderWidth) / 2.0;
-    final double offsetY = (vHeight - renderHeight) / 2.0;
-
-    final photoPath = _capturedPhotoPath;
-
-    return Center(
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(
-          _currentAspectRatio == CameraAspectRatio.full ? 0 : 16,
-        ),
-        child: Container(
-          width: vWidth,
-          height: vHeight,
-          decoration: BoxDecoration(
-            color: Colors.black,
-            border: Border.all(
-              color: _currentAspectRatio == CameraAspectRatio.full
-                  ? Colors.transparent
-                  : const Color(0xFF26C6DA).withValues(alpha: 0.3),
-              width: 1,
-            ),
-          ),
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              if (photoPath != null)
-                Image.file(
-                  File(photoPath),
-                  fit: BoxFit.cover,
-                  width: vWidth,
-                  height: vHeight,
+          icon: _videoBusy
+              ? const SizedBox.square(
+                  dimension: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              else ...[
-                Positioned(
-                  left: offsetX,
-                  top: offsetY,
-                  width: renderWidth,
-                  height: renderHeight,
-                  child: CameraPreview(cameraController),
+              : const Icon(Icons.fiber_manual_record),
+          label: Text(_videoBusy ? 'STARTING…' : 'START RECORDING'),
+        )
+      else
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _videoBusy ? null : _toggleSmartPause,
+                icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause),
+                label: Text(_isPaused ? 'RESUME' : 'PAUSE'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFF62D6B2),
+                  side: const BorderSide(color: Color(0xFF287C70)),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
                 ),
-                ...detectedPotholes.map((pothole) {
-                  final box = _previewBox(
-                    pothole,
-                    renderWidth: renderWidth,
-                    renderHeight: renderHeight,
-                    offsetX: offsetX,
-                    offsetY: offsetY,
-                  );
-                  if (box.left + box.width < 0 ||
-                      box.top + box.height < 0 ||
-                      box.left > vWidth ||
-                      box.top > vHeight) {
-                    return const SizedBox.shrink();
-                  }
-
-                  final severity = pothole['severity'] as String? ?? 'MEDIUM';
-                  final confidence =
-                      ((pothole['confidence'] as double? ?? 0.0) * 100).toInt();
-
-                  return Positioned(
-                    left: box.left,
-                    top: box.top,
-                    width: box.width,
-                    height: box.height,
-                    child: Stack(
-                      clipBehavior: Clip.none,
-                      children: [
-                        Container(
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: severity == 'LARGE'
-                                  ? const Color(0xFFFF5252)
-                                  : const Color(0xFFFFB74D),
-                              width: 2.5,
-                            ),
-                            borderRadius: BorderRadius.circular(6),
-                            boxShadow: [
-                              BoxShadow(
-                                color:
-                                    (severity == 'LARGE'
-                                            ? Colors.redAccent
-                                            : Colors.orangeAccent)
-                                        .withValues(alpha: 0.35),
-                                blurRadius: 6,
-                              ),
-                            ],
-                          ),
-                        ),
-                        Positioned(
-                          top: -18,
-                          left: 0,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: severity == 'LARGE'
-                                  ? const Color(0xFFD32F2F)
-                                  : const Color(0xFFF57C00),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Text(
-                              'Pothole $confidence%',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 9.5,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
-              ],
-            ],
-          ),
+              ),
+            ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: _videoBusy ? null : _stopSmartRecording,
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFFAF3151),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+                icon: _videoBusy
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.stop_circle_outlined),
+                label: const Text('STOP & SAVE'),
+              ),
+            ),
+          ],
+        ),
+      const SizedBox(height: 8),
+      OutlinedButton.icon(
+        onPressed: _snapshotSaving || _snapshotPending || _isPaused
+            ? null
+            : _requestSmartSnapshot,
+        icon: _snapshotSaving || _snapshotPending
+            ? const SizedBox.square(
+                dimension: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.camera_alt_outlined),
+        label: Text(
+          _snapshotSaving || _snapshotPending
+              ? 'CAPTURING SNAPSHOT…'
+              : 'SNAPSHOT',
         ),
       ),
-    );
-  }
+      if (_lastVideoPath != null) ...[
+        const SizedBox(height: 6),
+        Text(
+          'Video saved · ${_lastVideoPath!.split(Platform.pathSeparator).last}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Color(0xFF8FE8B3), fontSize: 10),
+        ),
+      ],
+      if (_lastSnapshotPath != null) ...[
+        const SizedBox(height: 4),
+        Text(
+          'Snapshot saved · ${_lastSnapshotPath!.split(Platform.pathSeparator).last}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Colors.white54, fontSize: 10),
+        ),
+      ],
+      if (_smartError != null) ...[
+        const SizedBox(height: 6),
+        Text(
+          _smartError!,
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Color(0xFFFFC857), fontSize: 11),
+        ),
+      ],
+    ],
+  );
 
-  Widget _buildShutterControls() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              const SizedBox(width: 44),
-              GestureDetector(
-                onTap: _isCapturing ? null : _capturePhotoAndGetLocation,
-                child: Container(
-                  width: 74,
-                  height: 74,
-                  padding: const EdgeInsets.all(4),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                      color: const Color(0xFF7DE5E9),
-                      width: 3.5,
-                    ),
-                  ),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: _isCapturing
-                          ? const Color(0xFF26C6DA).withValues(alpha: 0.5)
-                          : Colors.white,
-                    ),
-                    child: Center(
-                      child: _isCapturing
-                          ? const SizedBox(
-                              width: 26,
-                              height: 26,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2.8,
-                                color: Color(0xFF041421),
-                              ),
-                            )
-                          : const Icon(
-                              Icons.camera_alt,
-                              color: Color(0xFF041421),
-                              size: 28,
-                            ),
-                    ),
-                  ),
+  Widget _buildSmartScreen() => PopScope<Object?>(
+    canPop: !_isRecording,
+    onPopInvokedWithResult: (didPop, result) {
+      if (!didPop) unawaited(_closeSmartScreen());
+    },
+    child: Scaffold(
+      backgroundColor: const Color(0xFF070D16),
+      appBar: _isFullscreen
+          ? null
+          : AppBar(
+              backgroundColor: const Color(0xFF070D16),
+              title: const Text('SMART ROAD SCAN'),
+              titleTextStyle: const TextStyle(
+                color: Color(0xFFE4F6FA),
+                fontSize: 16,
+                fontWeight: FontWeight.w900,
+                letterSpacing: .8,
+              ),
+              leading: IconButton(
+                tooltip: 'Close camera',
+                onPressed: _closeSmartScreen,
+                icon: const Icon(Icons.close),
+              ),
+              actions: [
+                IconButton(
+                  tooltip: _alertsMuted
+                      ? 'Turn on voice alerts'
+                      : 'Mute voice alerts',
+                  onPressed: _toggleVoiceAlerts,
+                  icon: Icon(_alertsMuted ? Icons.volume_off : Icons.volume_up),
                 ),
-              ),
-              IconButton(
-                tooltip: 'Aspect Ratio Options',
-                onPressed: () {
-                  setState(() => _showRatioSettings = !_showRatioSettings);
-                },
-                icon: Icon(
-                  _showRatioSettings
-                      ? Icons.aspect_ratio
-                      : Icons.aspect_ratio_outlined,
-                  color: _showRatioSettings
-                      ? const Color(0xFF7DE5E9)
-                      : Colors.white70,
-                  size: 24,
+                IconButton(
+                  tooltip: 'Toggle fullscreen',
+                  onPressed: _toggleFullscreen,
+                  icon: const Icon(Icons.fullscreen),
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Live AI detection runs while camera is open',
-            style: TextStyle(color: Colors.white54, fontSize: 11),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildReviewControls() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-      decoration: const BoxDecoration(
-        color: Color(0xFF090F19),
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (currentPosition != null)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF103B34).withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF1E806B)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(
-                    Icons.location_on,
-                    color: Color(0xFF26C6DA),
-                    size: 22,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'GPS location attached',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 13,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        Text(
-                          '${currentPosition!.latitude.toStringAsFixed(6)}, ${currentPosition!.longitude.toStringAsFixed(6)} (±${currentPosition!.accuracy.toStringAsFixed(0)}m)',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            )
-          else
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF292F3A),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.white12),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    _isCapturing ? Icons.satellite_alt : Icons.location_off,
-                    color: Colors.amberAccent,
-                    size: 22,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _isCapturing
-                              ? 'Getting GPS location…'
-                              : 'GPS not ready',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 13,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        Text(
-                          _locationError ??
-                              'Location needed to save this report.',
-                          style: const TextStyle(
-                            color: Colors.white60,
-                            fontSize: 11,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (_isCapturing)
-                    const SizedBox.square(
-                      dimension: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.amberAccent,
-                      ),
-                    )
-                  else
-                    IconButton(
-                      onPressed: _retryLocation,
-                      icon: const Icon(Icons.refresh, color: Colors.white),
-                    ),
-                ],
-              ),
+              ],
             ),
-          const SizedBox(height: 10),
-          if (currentPosition != null) ...[
-            OutlinedButton.icon(
-              onPressed: _choosePhotoPinOnMap,
-              icon: const Icon(Icons.add_location_alt_outlined, size: 18),
-              label: Text(
-                _selectedPhotoPin != null
-                    ? 'Pin: ${_selectedPhotoPin!.latitude.toStringAsFixed(4)}, ${_selectedPhotoPin!.longitude.toStringAsFixed(4)}'
-                    : 'Adjust pothole pin on map',
-              ),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.white,
-                side: const BorderSide(color: Colors.white24),
-                minimumSize: const Size.fromHeight(40),
-              ),
-            ),
-            const SizedBox(height: 8),
-          ],
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _retakePhoto,
-                  icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('Retake'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white70,
-                    side: const BorderSide(color: Colors.white24),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                flex: 2,
-                child: FilledButton.icon(
-                  onPressed: currentPosition == null
-                      ? null
-                      : _saveCapturedReport,
-                  icon: const Icon(Icons.save_outlined, size: 18),
-                  label: const Text('Save Report'),
-                  style: FilledButton.styleFrom(
-                    foregroundColor: const Color(0xFF041421),
-                    backgroundColor: const Color(0xFF7DE5E9),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    textStyle: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
       body: SafeArea(
+        top: !_isFullscreen,
+        bottom: !_isFullscreen,
         child: FutureBuilder<void>(
           future: cameraFuture,
           builder: (context, snapshot) {
             if (snapshot.hasError) {
               return Center(
                 child: Padding(
-                  padding: const EdgeInsets.all(24.0),
+                  padding: const EdgeInsets.all(24),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const Icon(
-                        Icons.error_outline,
-                        color: Colors.redAccent,
-                        size: 48,
+                        Icons.videocam_off,
+                        size: 42,
+                        color: Colors.white54,
                       ),
-                      const SizedBox(height: 16),
-                      Text(
-                        'Camera could not start: ${snapshot.error}',
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Camera or live detection is unavailable.',
                         textAlign: TextAlign.center,
-                        style: const TextStyle(color: Colors.white70),
+                        style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '${snapshot.error}',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                        ),
                       ),
                       const SizedBox(height: 16),
-                      FilledButton.icon(
-                        onPressed: () => Navigator.of(context).pop(),
+                      OutlinedButton.icon(
+                        onPressed: _closeSmartScreen,
                         icon: const Icon(Icons.arrow_back),
-                        label: const Text('Go Back'),
+                        label: const Text('Back'),
                       ),
                     ],
                   ),
                 ),
               );
             }
-
-            if (snapshot.connectionState == ConnectionState.done &&
-                cameraController.value.isInitialized) {
-              return LayoutBuilder(
-                builder: (context, constraints) {
-                  return Column(
-                    children: [
-                      // Top Bar with back button, live status, ratio badge & setting logo
-                      _buildTopBar(),
-
-                      // Animated Segment Bar for { (1:1), (4:3), (16:9), (full) }
-                      if (_showRatioSettings) _buildSegmentBar(),
-
-                      // Viewfinder takes up the remaining available height
-                      Expanded(
-                        child: LayoutBuilder(
-                          builder: (context, boxConstraints) {
-                            return _buildViewfinder(
-                              boxConstraints.maxWidth,
-                              boxConstraints.maxHeight,
-                            );
-                          },
+            if (snapshot.connectionState != ConnectionState.done ||
+                !cameraController.value.isInitialized) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            return LayoutBuilder(
+              builder: (context, constraints) {
+                final wideLayout = constraints.maxWidth >= 760;
+                final preview = Padding(
+                  padding: EdgeInsets.all(wideLayout ? 12 : 8),
+                  child: _buildSmartPreview(constraints.maxWidth),
+                );
+                final panel = ListView(
+                  padding: EdgeInsets.fromLTRB(
+                    wideLayout ? 12 : 10,
+                    wideLayout ? 12 : 6,
+                    wideLayout ? 12 : 10,
+                    12,
+                  ),
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'LIVE TELEMETRY',
+                            style: TextStyle(
+                              color: Color(0xFF54EAF4),
+                              fontSize: 11,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: .8,
+                            ),
+                          ),
                         ),
-                      ),
-
-                      // Bottom Area: Shutter controls or Review options
-                      if (_capturedPhotoPath == null)
-                        _buildShutterControls()
-                      else
-                        _buildReviewControls(),
+                        if (_isRecording)
+                          Text(
+                            _recordingTimeLabel,
+                            style: const TextStyle(
+                              color: Color(0xFFFF687F),
+                              fontFeatures: [FontFeature.tabularFigures()],
+                              fontSize: 13,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    _buildSmartMetrics(constraints.maxWidth),
+                    const SizedBox(height: 10),
+                    _buildSmartControls(),
+                  ],
+                );
+                if (wideLayout) {
+                  return Row(
+                    children: [
+                      Expanded(flex: 7, child: preview),
+                      SizedBox(width: 390, child: panel),
                     ],
                   );
-                },
-              );
-            }
-
-            return const Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(
-                    color: Color(0xFF26C6DA),
-                    strokeWidth: 3,
-                  ),
-                  SizedBox(height: 16),
-                  Text(
-                    'Initializing camera...',
-                    style: TextStyle(color: Colors.white70, fontSize: 13),
-                  ),
-                ],
-              ),
+                }
+                return Column(
+                  children: [
+                    Expanded(flex: 7, child: preview),
+                    Flexible(flex: 4, child: panel),
+                  ],
+                );
+              },
             );
           },
         ),
+      ),
+    ),
+  );
+
+  @override
+  void dispose() {
+    _smartUiTimer?.cancel();
+    _locationSubscription?.cancel();
+    _scanController.dispose();
+    if (_isFullscreen) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    }
+    if (cameraController.value.isRecordingVideo) {
+      unawaited(() async {
+        try {
+          await cameraController.stopVideoRecording();
+        } catch (error) {
+          debugPrint('Could not stop video during camera cleanup: $error');
+        }
+      }());
+    }
+    cameraController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.smartMode) return _buildSmartScreen();
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('AIpothole Detection'),
+        centerTitle: true,
+      ),
+      body: FutureBuilder<void>(
+        future: cameraFuture,
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Text('Camera could not start: ${snapshot.error}'),
+            );
+          }
+          if (snapshot.connectionState == ConnectionState.done) {
+            final previewWidth = MediaQuery.sizeOf(context).width - 32;
+            final previewHeight = previewWidth / widget.captureAspectRatio;
+
+            return ListView(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+              children: [
+                const Text(
+                  'Point the camera at the pothole',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Capture frame: ${widget.captureAspectLabel}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white60, fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: previewWidth,
+                  height: previewHeight,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final photoPath = _capturedPhotoPath;
+                        if (photoPath != null) {
+                          return Image.file(File(photoPath), fit: BoxFit.cover);
+                        }
+
+                        final previewWidth = constraints.maxWidth;
+                        final previewActualHeight = constraints.maxHeight;
+                        final sensorPreviewAspect =
+                            1 / cameraController.value.aspectRatio;
+                        return Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            FittedBox(
+                              fit: BoxFit.cover,
+                              child: SizedBox(
+                                width: sensorPreviewAspect * 1000,
+                                height: 1000,
+                                child: CameraPreview(cameraController),
+                              ),
+                            ),
+                            ...detectedPotholes.map((pothole) {
+                              final box = _previewBox(
+                                pothole,
+                                previewWidth,
+                                previewActualHeight,
+                              );
+                              return Positioned(
+                                left: box.left,
+                                top: box.top,
+                                width: box.width,
+                                height: box.height,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                      color: Colors.red,
+                                      width: 3,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                if (_capturedPhotoPath == null) ...[
+                  FilledButton.icon(
+                    onPressed: _isCapturing
+                        ? null
+                        : _capturePhotoAndGetLocation,
+                    icon: _isCapturing
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.camera_alt),
+                    label: Text(
+                      _isCapturing ? 'Taking photo…' : 'Capture pothole photo',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Live AI detection runs while the camera is open.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white60, fontSize: 12),
+                  ),
+                ] else ...[
+                  if (currentPosition != null)
+                    Card(
+                      child: ListTile(
+                        leading: const Icon(Icons.location_on),
+                        title: const Text('GPS location attached'),
+                        subtitle: Text(
+                          'Latitude: ${currentPosition!.latitude.toStringAsFixed(6)}\n'
+                          'Longitude: ${currentPosition!.longitude.toStringAsFixed(6)}\n'
+                          'Accuracy: ±${currentPosition!.accuracy.toStringAsFixed(0)} m',
+                        ),
+                      ),
+                    )
+                  else
+                    Card(
+                      child: ListTile(
+                        leading: const Icon(Icons.location_off),
+                        title: Text(
+                          _isCapturing
+                              ? 'Getting GPS location…'
+                              : 'GPS not ready',
+                        ),
+                        subtitle: Text(
+                          _locationError ?? 'Photo is captured; location is needed to save this report.',
+                        ),
+                        trailing: _isCapturing
+                            ? const SizedBox.square(
+                                dimension: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : IconButton(
+                                onPressed: _retryLocation,
+                                icon: const Icon(Icons.refresh),
+                              ),
+                      ),
+                    ),
+                  if (currentPosition != null) ...[
+                    OutlinedButton.icon(
+                      onPressed: _choosePhotoPinOnMap,
+                      icon: const Icon(Icons.add_location_alt_outlined),
+                      label: const Text('Adjust pothole pin on map'),
+                    ),
+                    if (_selectedPhotoPin != null)
+                      Text(
+                        'Selected pin: ${_selectedPhotoPin!.latitude.toStringAsFixed(6)}, ${_selectedPhotoPin!.longitude.toStringAsFixed(6)}',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                        ),
+                      ),
+                  ],
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: _retakePhoto,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Retake photo'),
+                  ),
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: currentPosition == null
+                        ? null
+                        : _saveCapturedReport,
+                    icon: const Icon(Icons.save_outlined),
+                    label: const Text('Save photo with GPS report'),
+                  ),
+                ],
+              ],
+            );
+          }
+
+          return const Center(child: CircularProgressIndicator());
+        },
       ),
     );
   }
